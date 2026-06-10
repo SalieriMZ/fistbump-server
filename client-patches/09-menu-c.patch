@@ -1,0 +1,22 @@
+diff --git a/src/sf33rd/Source/Game/menu/menu.c b/src/sf33rd/Source/Game/menu/menu.c
+index 301f8725..bcad08bb 100644
+--- a/src/sf33rd/Source/Game/menu/menu.c
++++ b/src/sf33rd/Source/Game/menu/menu.c
+@@ -3493,6 +3493,17 @@ void VS_Result(struct _TASK* task_ptr) {
+ 
+     switch (task_ptr->r_no[2]) {
+     case 0:
++#if NETPLAY_ENABLED
++        if (Mode_Type == MODE_NETWORK) {
++            const MatchResult* mr = Fistbump_GetResult();
++            if (mr && mr->match_id[0] != '\0') {
++                // mr->player is 1 or 2. VS_Win_Record indexed 0/1.
++                int me_idx = mr->player - 1;
++                int opp_idx = 1 - me_idx;
++                Fistbump_SendResult(mr->match_id, VS_Win_Record[me_idx], VS_Win_Record[opp_idx]);
++            }
++        }
++#endif
+         System_all_clear_Level_B();
+         Menu_Init(task_ptr);
+         task_ptr->r_no[1] = 16;

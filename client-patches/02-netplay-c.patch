@@ -1,0 +1,179 @@
+diff --git a/src/platform/netplay/netplay.c b/src/platform/netplay/netplay.c
+index f6dc8d7c..9be63035 100644
+--- a/src/platform/netplay/netplay.c
++++ b/src/platform/netplay/netplay.c
+@@ -10,6 +10,7 @@
+ #include "sf33rd/Source/Game/effect/effect.h"
+ #include "sf33rd/Source/Game/engine/grade.h"
+ #include "sf33rd/Source/Game/engine/plcnt.h"
++#include "sf33rd/Source/Game/engine/vital.h"
+ #include "sf33rd/Source/Game/engine/workuser.h"
+ #include "sf33rd/Source/Game/game.h"
+ #include "sf33rd/Source/Game/io/gd3rd.h"
+@@ -79,6 +80,18 @@ static int stats_update_timer = 0;
+ static int frame_max_rollback = 0;
+ static NetworkStats network_stats = { 0 };
+ 
++// Stream live state to server every N frames (for web /watch dashboard)
++#define STATE_STREAM_INTERVAL_FRAMES 30
++static int state_stream_timer = 0;
++
++// Timeouts (frames @ 60fps)
++#define CONNECT_TIMEOUT_FRAMES 600 // 10s — no GekkoSessionStarted → reset
++#define PEER_SILENT_TIMEOUT_FRAMES 300 // 5s — frames_behind growing unbounded → peer dead
++
++static int connect_timeout_counter = 0;
++static int peer_silent_counter = 0;
++static float prev_frames_behind = 0;
++
+ #if DEBUG
+ #define STATE_BUFFER_MAX 20
+ 
+@@ -165,12 +178,11 @@ static void configure_gekko() {
+     config.num_players = PLAYER_COUNT;
+     config.input_size = sizeof(u16);
+     config.state_size = sizeof(State);
+-    config.max_spectators = 0;
++    config.max_spectators = 8; // Allow spectators to join via WATCH protocol
+     config.input_prediction_window = 10;
+ 
+-#if DEBUG
++    // Always enable desync detection — overhead is small, value is huge
+     config.desync_detection = true;
+-#endif
+ 
+     if (gekko_create(&session, GekkoGameSession)) {
+         gekko_start(session, &config);
+@@ -491,15 +503,21 @@ static void process_session() {
+         case GekkoSessionStarted:
+             printf("🔴 session started\n");
+             session_state = NETPLAY_SESSION_RUNNING;
++            connect_timeout_counter = 0;
++            peer_silent_counter = 0;
++            prev_frames_behind = 0;
+             break;
+ 
+         case GekkoDesyncDetected:
+             const int frame = event->data.desynced.frame;
+-            printf("⚠️ desync detected at frame %d\n", frame);
++            printf("⚠️ desync detected at frame %d — aborting match\n", frame);
+ 
+ #if DEBUG
+             dump_saved_state(frame);
+ #endif
++            // Match state diverged between peers. Continuing would be useless
++            // (players see different realities). Force both sides to soft reset.
++            handle_disconnection();
+             break;
+ 
+         case GekkoEmptySessionEvent:
+@@ -545,6 +563,11 @@ static void process_events(bool drawing_allowed) {
+ 
+ static void step_logic(bool drawing_allowed) {
+     process_session();
++    // If disconnect was detected during session events, bail out before
++    // running game events (gekko session may be invalid).
++    if (session_state == NETPLAY_SESSION_EXITING || session_state == NETPLAY_SESSION_IDLE) {
++        return;
++    }
+     process_events(drawing_allowed);
+ }
+ 
+@@ -572,12 +595,40 @@ static void update_network_stats() {
+     stats_update_timer = SDL_max(stats_update_timer, 0);
+ }
+ 
++static void stream_state_to_server() {
++    // Player 1 reports state — avoid duplicates (P2 stays silent).
++    if (player_number != 0) {
++        return;
++    }
++    const MatchResult* mr = Fistbump_GetResult();
++    if (!mr || mr->match_id[0] == '\0') {
++        return;
++    }
++    if (state_stream_timer > 0) {
++        state_stream_timer--;
++        return;
++    }
++    state_stream_timer = STATE_STREAM_INTERVAL_FRAMES;
++
++    // Vital max is 160 in SF3 (Max_vitality). Convert to %.
++    int hp1 = (vit[0].cyerw * 100) / 160;
++    int hp2 = (vit[1].cyerw * 100) / 160;
++    if (hp1 < 0) hp1 = 0; if (hp1 > 100) hp1 = 100;
++    if (hp2 < 0) hp2 = 0; if (hp2 > 100) hp2 = 100;
++    Fistbump_SendState(mr->match_id, hp1, hp2, Round_num, My_char[0], My_char[1]);
++}
++
+ static void run_netplay() {
+     // Step
+ 
+     const bool catch_up = need_to_catch_up() && (frame_skip_timer == 0);
+     step_logic(!catch_up);
+ 
++    // Bail out if disconnect happened during step_logic
++    if (session_state == NETPLAY_SESSION_EXITING || session_state == NETPLAY_SESSION_IDLE) {
++        return;
++    }
++
+     if (catch_up) {
+         step_logic(true);
+         frame_skip_timer = FRAME_SKIP_TIMER_MAX;
+@@ -586,9 +637,9 @@ static void run_netplay() {
+     frame_skip_timer -= 1;
+     frame_skip_timer = SDL_max(frame_skip_timer, 0);
+ 
+-    // Update stats
+-
++    // Update stats + stream state for web dashboard
+     update_network_stats();
++    stream_state_to_server();
+ }
+ 
+ void Netplay_SetParams(int player, const char* ip) {
+@@ -648,7 +699,7 @@ void Netplay_BeginMatchmaking() {
+     }
+     // session_state stays IDLE so the menu keeps running normally.
+     // setup_vs_mode() and the session transition happen in Netplay_TickMatchmaking.
+-    Fistbump_Start(matchmaking_server_ip, matchmaking_server_port, 9001, Paths_GetPrefPath());
++    Fistbump_Start(matchmaking_server_ip, matchmaking_server_port, matchmaking_server_port + 1, Paths_GetPrefPath());
+     matchmaking_pending = true;
+ }
+ 
+@@ -716,12 +767,35 @@ void Netplay_Run() {
+         if (transition_ready_frames >= 2) {
+             configure_gekko();
+             session_state = NETPLAY_SESSION_CONNECTING;
++            connect_timeout_counter = 0;
+         }
+ 
+         break;
+ 
+     case NETPLAY_SESSION_CONNECTING:
++        // Timeout while waiting for peer handshake (GekkoSessionStarted)
++        connect_timeout_counter++;
++        if (connect_timeout_counter > CONNECT_TIMEOUT_FRAMES) {
++            printf("🔴 connect timeout — peer never responded\n");
++            handle_disconnection();
++            break;
++        }
++        run_netplay();
++        break;
++
+     case NETPLAY_SESSION_RUNNING:
++        // Detect stalled peer: frames_behind growing without bound
++        if (frames_behind > prev_frames_behind && frames_behind > 5) {
++            peer_silent_counter++;
++        } else {
++            peer_silent_counter = 0;
++        }
++        prev_frames_behind = frames_behind;
++        if (peer_silent_counter > PEER_SILENT_TIMEOUT_FRAMES) {
++            printf("🔴 peer silent timeout — forcing disconnect\n");
++            handle_disconnection();
++            break;
++        }
+         run_netplay();
+         break;
+ 

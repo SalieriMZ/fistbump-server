@@ -1,0 +1,20 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1ce747a4..a9581ca6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -76,6 +76,7 @@ else()
+         $<$<CONFIG:Debug>:NETPLAY_ENABLED>
+ 
+         $<$<CONFIG:Release>:RELEASE>
++        $<$<CONFIG:Release>:NETPLAY_ENABLED>
+         $<$<CONFIG:Release>:CHECKSUM>
+         
+         $<$<CONFIG:Statcheck>:STATCHECK>
+@@ -142,6 +143,7 @@ target_compile_options(3sx PRIVATE
+     ${DISABLED_WARNINGS}
+ 
+     $<$<OR:$<CONFIG:Debug>,$<CONFIG:Statcheck>>:-Wno-unused-function>
++    $<$<CONFIG:Release>:-Wno-unused-function>
+     # $<$<CONFIG:Debug>:-Wno-unused-variable>
+     -Wno-unused-variable
+     $<$<OR:$<CONFIG:Debug>,$<CONFIG:Statcheck>>:-Wno-unused-but-set-variable>

@@ -1,0 +1,94 @@
+diff --git a/src/main.c b/src/main.c
+index 8c31c33b..6948c94a 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -31,6 +31,15 @@
+ #include "sf33rd/Source/PS2/mc/mcsub.h"
+ #include "structs.h"
+ 
++#if NETPLAY_ENABLED
++#include "args.h"
++#include "platform/netplay/netplay.h"
++#include <stdlib.h>
++
++static bool netplay_auto_p2p_pending = false;
++static int netplay_auto_p2p_delay_frames = 0;
++#endif
++
+ #include <SDL3/SDL.h>
+ 
+ #include <memory.h>
+@@ -109,6 +118,41 @@ void Main_Init() {
+     ppgMakeConvTableTexDC();
+     appSetupBasePriority();
+ 
++#if NETPLAY_ENABLED
++    {
++        // Netplay is OPT-IN. Game launched without netplay flags/env stays offline.
++        // Use the launcher (3sx_launcher_online) to set these flags for online play.
++        const Args* a = get_args();
++        const char* host_env = getenv("FISTBUMP_HOST");
++        const char* port_env = getenv("FISTBUMP_PORT");
++        const char* host = a->netplay.matchmaking_ip
++                          ? a->netplay.matchmaking_ip
++                          : host_env;
++        int port = a->netplay.matchmaking_port
++                  ? a->netplay.matchmaking_port
++                  : (port_env ? atoi(port_env) : 0);
++
++        if (host && port > 0) {
++            static char host_buf[128];
++            SDL_strlcpy(host_buf, host, sizeof(host_buf));
++            Netplay_SetMatchmakingParams(host_buf, port);
++            SDL_Log("Fistbump matchmaking: %s:%d\n", host_buf, port);
++        } else {
++            SDL_Log("Netplay: no matchmaking server configured — offline mode\n");
++        }
++
++        if (a->netplay.p2p_remote_ip && a->netplay.p2p_local_player > 0) {
++            static char p2p_ip_buf[64];
++            SDL_strlcpy(p2p_ip_buf, a->netplay.p2p_remote_ip, sizeof(p2p_ip_buf));
++            Netplay_SetParams(a->netplay.p2p_local_player, p2p_ip_buf);
++            netplay_auto_p2p_pending = true;
++            netplay_auto_p2p_delay_frames = 180; // ~3s @ 60fps to let boot complete
++            SDL_Log("Netplay auto P2P: player=%d remote=%s (will begin in %d frames)\n",
++                a->netplay.p2p_local_player, p2p_ip_buf, netplay_auto_p2p_delay_frames);
++        }
++    }
++#endif
++
+ #if !MEMCARD_DISABLED
+     MemcardInit();
+ #endif
+@@ -284,8 +328,31 @@ void Main_StepFrame() {
+ 
+     mpp_w.inGame = false;
+ 
++#if NETPLAY_ENABLED
++    {
++        NetplaySessionState ss = Netplay_GetSessionState();
++        // Skip local njUserMain/draw only when GekkoNet is driving game steps
++        // (CONNECTING/RUNNING). In TRANSITIONING the game still needs normal
++        // task flow to reach char select. In IDLE/EXITING run normally.
++        bool gekko_driving = (ss == NETPLAY_SESSION_CONNECTING || ss == NETPLAY_SESSION_RUNNING);
++
++        if (!gekko_driving) {
++            njUserMain();
++        }
++
++        Netplay_TickDirectP2P();
++        Netplay_TickMatchmaking();
++        Netplay_Run();
++
++        if (!gekko_driving) {
++            njdp2d_draw();
++        }
++    }
++#else
+     njUserMain();
+     njdp2d_draw();
++#endif
++
+     KnjFlush();
+     disp_effect_work();
+     flFlip(0);

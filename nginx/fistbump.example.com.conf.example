@@ -1,0 +1,27 @@
+# Example nginx reverse-proxy in front of the fistbump stats HTTP listener.
+# Replace `fistbump.example.com` with your own hostname and run certbot for
+# TLS. The game's matchmaking traffic (TCP 19000 + UDP 19001/19002) does NOT
+# go through nginx — those ports must be exposed directly to the internet.
+
+server {
+    listen 80;
+    server_name fistbump.example.com;
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name fistbump.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/fistbump.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/fistbump.example.com/privkey.pem;
+
+    location / {
+        # Stats HTTP listener binds to 127.0.0.1:(tcp_port+1000).
+        # Default: TCP 19000 → stats 20000.
+        proxy_pass http://127.0.0.1:20000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

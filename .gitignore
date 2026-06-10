@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-journal
+token_secret
+bans.json
+.venv/
+.env
+launcher/build/
+launcher/dist/
+launcher/*.spec

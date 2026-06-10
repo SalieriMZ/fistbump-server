@@ -1,0 +1,32 @@
+[Unit]
+Description=3SX Fistbump matchmaking server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fistbump
+Group=fistbump
+WorkingDirectory=/opt/fistbump
+EnvironmentFile=-/etc/default/fistbump
+# Edit /etc/default/fistbump to set PUBLIC_HOST=<your-server-ip-or-hostname>.
+# Falls back to 127.0.0.1 for local development.
+ExecStart=/usr/bin/python3 /opt/fistbump/server.py --host 0.0.0.0 --tcp-port 19000 --udp-port 19001 --relay-port 19002 --public-host ${PUBLIC_HOST:-127.0.0.1}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/fistbump
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

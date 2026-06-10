@@ -1,0 +1,34 @@
+diff --git a/src/sf33rd/Source/Game/menu/netplay_menu.c b/src/sf33rd/Source/Game/menu/netplay_menu.c
+index de737d86..2c927b5e 100644
+--- a/src/sf33rd/Source/Game/menu/netplay_menu.c
++++ b/src/sf33rd/Source/Game/menu/netplay_menu.c
+@@ -1,4 +1,5 @@
+ #include "sf33rd/Source/Game/menu/netplay_menu.h"
++#include "args.h"
+ #include "main.h"
+ #include "platform/netplay/fistbump.h"
+ #include "platform/netplay/netplay.h"
+@@ -154,6 +155,23 @@ void Netplay_Menu(struct _TASK* task_ptr) {
+             SE_cursor_move();
+         }
+ 
++        // Auto FindMatch / RoomJoin: once logged in and idle, take action.
++        // Bypasses the broken netplay menu UI rendering.
++        if (login_state && fs == FISTBUMP_IDLE && Menu_Page == 1) {
++            const Args* a = get_args();
++            if (a->netplay.room_code && a->netplay.room_code[0]) {
++                Fistbump_RoomJoin(a->netplay.room_code);
++            } else {
++                Netplay_FindMatch();
++            }
++            break;
++        }
++        // Auto Accept: when matched, accept immediately.
++        if (fs == FISTBUMP_MATCHED) {
++            Fistbump_AcceptMatch();
++            break;
++        }
++
+         if ((IO_Result == SWK_EAST || (IO_Result == SWK_SOUTH && Menu_Cursor_Y[0] == Menu_Max && Menu_Page != 0)) &&
+             (fs == FISTBUMP_IDLE || fs == FISTBUMP_AWAITING_LOGIN)) {
+             Menu_Suicide[0] = 0;
