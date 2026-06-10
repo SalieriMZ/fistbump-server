@@ -1,110 +1,131 @@
-# 3sx-fistbump-server
+# fistbump-server
 
-Self-host matchmaking server para [crowded-street/3sx](https://github.com/crowded-street/3sx).
+Matchmaking + ELO + lobby + relay server for [`SalieriMZ/3sx-online`](https://github.com/SalieriMZ/3sx-online) — the cross-platform rollback netplay fork of [crowded-street/3sx](https://github.com/crowded-street/3sx).
 
-Implementa el protocolo Fistbump (TCP signaling + UDP NAT punch) para parear dos clientes 3sx que después corren rollback P2P vía GekkoNet.
+Single-process Python 3.11+ asyncio server. SQLite for accounts + match history. No external services required to run locally; production drops a systemd unit on a single Linux box and points the client at it via `regions.txt`.
 
-## Status
+## What it does
 
-- [x] Fase 1 — recon protocolo
-- [x] Fase 2 — server stub mínimo
-- [x] Fase 3 — pairing real
-- [x] Fase 4 — patch cliente preparado (`src/main.c`)
-- [ ] Fase 4 — test localhost (espera build cliente)
-- [ ] Fase 5 — LAN
-- [ ] Fase 6 — WAN / NAT
-- [x] Fase 7 — hardening (janitor, Dockerfile, systemd)
+| Surface | Purpose |
+|---|---|
+| TCP 19000 | Line-protocol signaling: `HELLO / REGISTER / LOGIN / REFRESH / SET / QUEUE / ROOM / CHAT / RESULT / STATE / DECLINE`. Server-pushed: `SESSION / TOKEN / PROFILE / MATCH / START / REJECT / CANCEL / LOADING`. |
+| UDP 19001 | NAT-punch + endpoint discovery. Server captures the public `(ip, port)` of each peer's punch packet, dispatches them at `START` time. |
+| UDP 19002 | Relay fallback for CGNAT / symmetric-NAT peers. 36-char match-id prefix + 1-char side selector routes packets. |
+| HTTP 20000 (loopback) | Stats JSON + live-match viewer + leaderboard. Expected behind nginx + TLS (sample at `nginx/fistbump.example.com.conf.example`). |
 
-## Archivos
+Auth: HMAC-SHA256 refresh tokens, PBKDF2-SHA256 password hashing (200k iterations). Rate limited per IP for connect / login / queue / chat. Soft-banlist via `bans.json`.
 
-| File | Qué hace |
-|------|----------|
-| `server.py` | Server asyncio TCP+UDP |
-| `test_client.py` | Cliente Python simulado (1 instancia) |
-| `test_decline.py` | Test flow DECLINE → CANCEL |
-| `client.patch` | Diff cliente para apuntar matchmaking |
-| `Dockerfile` | Container deploy |
-| `fistbump.service` | Systemd unit |
-| `deploy.sh` | Deploy a upstream server VPS |
-| `PROTOCOL.md` | Spec completa protocolo |
-| `PHASES.md` | Plan implementación |
+Multi-region: edge nodes can forward `REGISTER / LOGIN / REFRESH / RESULT` to a leader node via `--upstream-url` so every region writes to one source-of-truth leaderboard.
 
-## Quick start (local)
+## Quick start
 
-### Server
-
-```bash
-python server.py --tcp-port 9000 --udp-port 9001 -v
+```sh
+python3 server.py --tcp-port 9000 --udp-port 9001 -v
 ```
 
-### Cliente patch
+On another machine (or the same one), point a client at it by dropping a `regions.txt` somewhere the client reads:
 
-Ya aplicado a `src/main.c` en repo 3sx local. Setea matchmaking IP=127.0.0.1, port=9000 al boot.
-
-Override runtime:
-```bash
-FISTBUMP_HOST=192.168.1.10 FISTBUMP_PORT=9000 ./3sx.exe
+```
+# code|label|host|port
+local|Local|127.0.0.1|9000
 ```
 
-Override build-time:
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug \
-    -DCMAKE_C_FLAGS="-DFISTBUMP_HOST=\\\"matchmaking.example.com\\\" -DFISTBUMP_PORT=9000"
+See [`SalieriMZ/3sx-online`](https://github.com/SalieriMZ/3sx-online) for client-side configuration.
+
+### Testing without the game
+
+Spin up two anonymous sessions (server has to be started with `FISTBUMP_ALLOW_ANON=1`):
+
+```sh
+FISTBUMP_ALLOW_ANON=1 python3 server.py --tcp-port 9000 --udp-port 9001 -v
 ```
 
-### Test sin cliente real
+then attach raw TCP clients:
 
-```bash
-# Terminal 1
-python server.py -v
-
-# Terminal 2
-python test_client.py --name A
-
-# Terminal 3
-python test_client.py --name B
+```sh
+nc localhost 9000
+> HELLO 1.3.0
+< SESSION <sid>
+> QUEUE casual
+...
 ```
 
-Esperado: ambos progresan hasta `🎮 GAME START — peer=...`.
+## Deploy
 
-## Deploy upstream server
+`deploy.sh` provisions a generic Ubuntu host: creates the `fistbump` system user, drops `server.py` + `fistbump.service` + `/etc/default/fistbump`, restarts the service.
 
-```bash
-./deploy.sh
+```sh
+REMOTE_HOST=fistbump.example.com \
+SSH_KEY=~/.ssh/fistbump \
+PUBLIC_HOST=fistbump.example.com \
+bash deploy.sh
 ```
 
-Abrir en consola AWS upstream server:
-- TCP 9000 (signaling)
-- UDP 9001 (NAT punch)
+`fistbump.service` reads `PUBLIC_HOST` from `/etc/default/fistbump` and passes it via `--public-host`. Clients in the **direct** path are told to UDP-punch this address.
 
-## Docker
+### Docker
 
-```bash
+```sh
 docker build -t fistbump .
 docker run -d --name fistbump \
-    -p 9000:9000/tcp \
-    -p 9001:9001/udp \
+    -e FISTBUMP_ALLOW_ANON=0 \
+    -p 19000:19000/tcp \
+    -p 19001:19001/udp \
+    -p 19002:19002/udp \
     --restart=unless-stopped \
     fistbump
 ```
 
-## Protocolo
+### Behind nginx + TLS
 
-Ver [PROTOCOL.md](PROTOCOL.md) para spec completa.
+Copy `nginx/fistbump.example.com.conf.example` to your sites-enabled, replace the hostname, run certbot. Only the stats HTTP (loopback `127.0.0.1:20000`) goes through nginx; matchmaking TCP/UDP stay direct.
 
-Resumen:
-- TCP 9000: HELLO/QUEUE/MATCH/START signaling
-- UDP 9001: `<sid> <match_id>` NAT punch + endpoint discovery
-- Server captura `(IP_pub, port_pub)` del datagrama UDP → manda en `START` al peer
-- Client reusa el socket UDP de Fistbump como socket GekkoNet → NAT mapping preservado
+## Publishing client updates
 
-## Limitaciones
+`publish_update.sh` SCPs a `3sx-x.y.z.zip` + new `<channel>.json` manifest to the server. Required env vars: `HOST`, `PUBLIC_BASE_URL`. Optional: `SSH_KEY`, `REMOTE_DIR`.
 
-- **Sin auth real**: server stub omite OAuth device-grant (DAG flow). Username generado aleatoriamente.
-- **Sin TURN relay**: NAT simétrico → falla. Workaround: port-forward UDP del puerto efímero (difícil) o usar Tailscale.
-- **No persistencia**: queue + matches en memoria. Restart = pierde estado.
-- **Sin moderación**: cualquiera puede conectar.
+```sh
+source publish_update.env   # copy from publish_update.env.example, fill in
+bash publish_update.sh 1.7.27 dist/3sx-1.7.27.zip stable
+bash publish_update.sh 1.7.27 dist/3sx-1.7.27.zip beta
+```
 
-## Roadmap
+The launcher under `launcher/` is bundled into each desktop build by `build_dist.sh`. Bump `launcher/launcher.py` `APP_VERSION` + `server.py` `ALLOWED_VERSIONS` in lockstep.
 
-Ver [PHASES.md](PHASES.md).
+## Repo layout
+
+```
+server.py                  Single-file asyncio server (~2.7k LOC).
+fistbump.service           Systemd unit, reads /etc/default/fistbump.
+deploy.sh                  Generic SSH deploy of server.py + unit.
+publish_update.sh          SCP zip + manifest + chown on the remote.
+publish_update.env.example Required env vars for publish_update.sh.
+build_dist.sh              Build 3sx.exe + slim launcher + bootstrap → dist/.
+Dockerfile                 Alpine + python3 + server.py copy.
+nginx/                     Reverse-proxy template.
+launcher/                  Tk-based desktop launcher (Play + auto-update).
+client-patches/            Numbered patches that wire netplay into the
+                           upstream crowded-street/3sx client source tree.
+client.patch               Aggregated single-diff of the same patches.
+```
+
+## Configuration
+
+| Env var | Default | Effect |
+|---|---|---|
+| `FISTBUMP_ALLOW_ANON` | `0` | Allow `HELLO` without credentials (dev/local only). |
+| `FISTBUMP_RATE_WHITELIST` | empty | Comma-separated IPs exempt from per-IP rate limits. |
+| `--public-host` / `$PUBLIC_HOST` | `127.0.0.1` | Public IP/hostname advertised to clients in `START`. |
+| `--tcp-port` | `9000` | Signaling port. |
+| `--udp-port` | `9001` | NAT-punch + match-data port (reused as the GekkoNet socket on the client side). |
+| `--relay-port` | `19002` | Relay UDP port for CGNAT peers. |
+| `--upstream-url` | unset | Edge mode: HTTPS base URL of the leader for auth + result forwarding. |
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
+
+## Acknowledgements
+
+- [crowded-street/3sx](https://github.com/crowded-street/3sx) — the decompilation that the netplay client builds on.
+- [GekkoNet](https://github.com/HeatXD/GekkoNet) — the rollback library used by the client.
