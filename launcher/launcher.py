@@ -27,6 +27,18 @@ from typing import Optional
 
 APP_VERSION = "1.7.26"  # launcher version (this Python app + UI)
 GAME_VERSION = "1.6.9"  # game build packaged in this launcher's zip (3sx.exe content)
+
+# Verbose mode: print discovered paths, env vars, and the exact args used to
+# launch the game. Toggle with `--verbose` / `-v` on the command line or via
+# the FISTBUMP_VERBOSE=1 env var. Useful for diagnosing "the launcher started
+# the wrong server" / "regions list is wrong" reports without attaching a
+# debugger.
+VERBOSE = "--verbose" in sys.argv or "-v" in sys.argv or os.environ.get("FISTBUMP_VERBOSE", "0") not in ("", "0", "false", "False")
+
+def vlog(*args, **kwargs):
+    if VERBOSE:
+        print("[launcher]", *args, file=sys.stderr, **kwargs)
+
 DEFAULT_SERVER = os.environ.get("FISTBUMP_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("FISTBUMP_PORT", "19000"))
 
@@ -52,6 +64,13 @@ def _parse_regions_env(raw: str):
 
 
 REGIONS = _parse_regions_env(os.environ.get("FISTBUMP_REGIONS", "")) or _DEFAULT_REGIONS
+
+vlog(f"APP_VERSION={APP_VERSION} GAME_VERSION={GAME_VERSION}")
+vlog(f"DEFAULT_SERVER={DEFAULT_SERVER}:{DEFAULT_PORT}")
+vlog(f"FISTBUMP_REGIONS env: {os.environ.get('FISTBUMP_REGIONS', '(unset)')}")
+vlog(f"REGIONS effective:    {REGIONS}")
+vlog(f"sys.executable={sys.executable!r}  frozen={getattr(sys, 'frozen', False)}")
+vlog(f"argv={sys.argv}")
 
 
 def _icd_friendly_name(path: str) -> str:
@@ -952,9 +971,13 @@ class LauncherApp:
         # Belt-and-suspenders: vendor-style disable env var as well.
         env["DISABLE_VK_LAYER_AMD_switchable_graphics_1"] = "1"
 
+        vlog(f"launching game: exe={exe!r}")
+        vlog(f"  args: {args}")
+        vlog(f"  VK_ICD_FILENAMES={env.get('VK_ICD_FILENAMES', '(unset)')}")
         try:
             self.game_proc = subprocess.Popen(args, env=env)
             self.status_var.set(f"Game running (PID {self.game_proc.pid}).")
+            vlog(f"  pid={self.game_proc.pid}")
         except Exception as e:
             messagebox.showerror("Launch failed", str(e))
 
