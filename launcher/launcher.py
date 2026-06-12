@@ -25,7 +25,7 @@ from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Optional
 
-APP_VERSION = "1.7.26"  # launcher version (this Python app + UI)
+APP_VERSION = "1.7.27"  # launcher version (this Python app + UI)
 GAME_VERSION = "1.6.9"  # game build packaged in this launcher's zip (3sx.exe content)
 
 # Verbose mode: print discovered paths, env vars, and the exact args used to
@@ -186,6 +186,14 @@ UPDATE_BASE_URL = os.environ.get(
 )
 RELEASE_CHANNELS = ("stable", "beta")
 DEFAULT_CHANNEL = "stable"
+
+# Update source. Default: the GitHub Releases page of the public repo —
+# players re-download from github.com (HTTPS, public checksums) instead of
+# pulling zips off the matchmaking host. Forks that self-host a manifest
+# channel can set FISTBUMP_UPDATE_BASE_URL to restore the legacy in-place
+# updater (UPDATE_BASE_URL is still used for log telemetry either way).
+UPDATE_USE_MANIFEST = "FISTBUMP_UPDATE_BASE_URL" in os.environ
+UPDATE_REPO = os.environ.get("FISTBUMP_UPDATE_REPO", "SalieriMZ/3sx-online")
 
 
 def update_manifest_url(channel: str) -> str:
@@ -773,23 +781,81 @@ class LauncherApp:
         except Exception:
             pass
 
+    def _installed_version(self) -> str:
+        """Version of what's actually on disk — NOT this launcher's build
+        constant. Comparing against APP_VERSION made a stale launcher exe
+        prompt for the same update forever, no matter what was installed.
+        Probe order: VERSION file next to the exe (shipped in dist zips) →
+        current.txt at the install root (launcher-managed installs) →
+        APP_VERSION as last resort."""
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).resolve().parent
+        else:
+            base = Path(__file__).resolve().parent
+        for probe in (base / "VERSION", self._install_root() / "current.txt"):
+            try:
+                v = probe.read_text(encoding="utf-8").strip()
+            except Exception:
+                continue
+            if v:
+                return v
+        return APP_VERSION
+
     def _check_update(self):
-        """Worker thread: poll manifest, prompt on main thread if newer."""
-        channel = self.cfg.get("channel", DEFAULT_CHANNEL)
-        if channel not in RELEASE_CHANNELS:
-            channel = DEFAULT_CHANNEL
+        """Worker thread: check for a newer release, prompt on main thread."""
+        local = self._installed_version()
+        if UPDATE_USE_MANIFEST:
+            # Legacy self-hosted channel (FISTBUMP_UPDATE_BASE_URL set).
+            channel = self.cfg.get("channel", DEFAULT_CHANNEL)
+            if channel not in RELEASE_CHANNELS:
+                channel = DEFAULT_CHANNEL
+            try:
+                req = urllib.request.Request(update_manifest_url(channel))
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    manifest = json.loads(r.read().decode("utf-8"))
+            except Exception:
+                return  # silent — never block login on a flaky update server
+            srv_version = str(manifest.get("version", "")).strip()
+            if not srv_version:
+                return
+            if self._parse_version(srv_version) <= self._parse_version(local):
+                return
+            self.root.after(0, lambda: self._prompt_update(manifest))
+            return
+
+        # Default: GitHub Releases. Players re-download from github.com.
         try:
-            req = urllib.request.Request(update_manifest_url(channel))
-            with urllib.request.urlopen(req, timeout=5) as r:
-                manifest = json.loads(r.read().decode("utf-8"))
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                headers={"User-Agent": "3sx-launcher",
+                         "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                rel = json.loads(r.read().decode("utf-8"))
         except Exception:
-            return  # silent — never block login on a flaky update server
-        srv_version = str(manifest.get("version", "")).strip()
-        if not srv_version:
+            return  # silent — never block login on a flaky network
+        tag = str(rel.get("tag_name", "")).strip()
+        version = tag
+        for prefix in ("stable-", "v"):
+            if version.startswith(prefix):
+                version = version[len(prefix):]
+        if not version:
             return
-        if self._parse_version(srv_version) <= self._parse_version(APP_VERSION):
+        if self._parse_version(version) <= self._parse_version(local):
             return
-        self.root.after(0, lambda: self._prompt_update(manifest))
+        url = rel.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest"
+        vlog(f"update available: local={local} remote={version} url={url}")
+        self.root.after(0, lambda: self._prompt_github_update(version, url))
+
+    def _prompt_github_update(self, version: str, url: str):
+        if not messagebox.askyesno(
+            "Update available",
+            f"3SX {version} is available.\n\n"
+            "Open the GitHub download page? Grab the new zip and extract it "
+            "over this folder."
+        ):
+            return
+        import webbrowser
+        webbrowser.open(url)
 
     def _log_upload_loop(self):
         while True:
