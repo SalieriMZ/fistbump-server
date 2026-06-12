@@ -10,3 +10,4 @@ bans.json
 launcher/build/
 launcher/dist/
 launcher/*.spec
+.test-room-e2e/

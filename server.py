@@ -24,10 +24,14 @@ from typing import Optional
 
 log = logging.getLogger("fistbump")
 
-DB_PATH = "/opt/fistbump/users.db"
+# Data dir: FISTBUMP_DATA_DIR env > /opt/fistbump (production) > cwd (local dev).
+_DATA_DIR = os.environ.get("FISTBUMP_DATA_DIR") or (
+    "/opt/fistbump" if os.path.isdir("/opt/fistbump") else "."
+)
+DB_PATH = os.path.join(_DATA_DIR, "users.db")
 TOKEN_TTL_DAYS = 30
-TOKEN_SECRET_FILE = "/opt/fistbump/token_secret"
-INTERNAL_SECRET_FILE = "/opt/fistbump/internal_secret"
+TOKEN_SECRET_FILE = os.path.join(_DATA_DIR, "token_secret")
+INTERNAL_SECRET_FILE = os.path.join(_DATA_DIR, "internal_secret")
 
 
 # SF6-style rank tiers based on internal ELO (LP-equivalent).
@@ -265,8 +269,11 @@ QUEUE_IDLE_TIMEOUT_S = 300  # 5 min — kick idle queued clients
 MATCH_PUNCH_TIMEOUT_S = 20  # peers have 20s to UDP-punch (accept) after MATCH
 FINALIZE_GRACE_S = 1800  # keep finalized match relay alive 30min for REMATCH; auto-refreshes per UDP packet in handle_relay
 
-# Allowed client versions. Add new ones here when bumping.
-ALLOWED_VERSIONS = {"1.3.0", "1.6.4", "1.6.5", "1.6.6", "1.6.7", "1.6.8", "1.6.9", "1.7.0", "1.7.1", "1.7.2", "1.7.3", "1.7.4", "1.7.5", "1.7.6", "1.7.7", "1.7.8", "1.7.9", "1.7.10", "1.7.11", "1.7.12", "1.7.13", "1.7.14", "1.7.15", "1.7.16", "1.7.17", "1.7.18", "1.7.19", "1.7.20", "1.7.21", "1.7.22", "1.7.23", "1.7.24", "1.7.25", "1.7.26", "1.7.27"}  # 1.3.0 = game protocol; 1.6.x..1.7.x = launcher
+# Allowed client versions — latest release only. The 1.7.28 protocol added
+# the platform auth field, full-length PROFILE usernames, and the ROOM STATE
+# scores token; older clients half-work, so they are rejected and the
+# launcher's update prompt walks them to the current release.
+ALLOWED_VERSIONS = {"1.3.1", "1.7.28"}  # 1.3.1 = game protocol; 1.7.28 = launcher
 
 ALLOWED_CHAT_SCOPES = {"general", "match", "room"}
 MAX_CHAT_LEN = 256
@@ -286,6 +293,15 @@ BAN_FILE = "/opt/fistbump/bans.json"  # {"1.2.3.4": "reason text", ...}
 ALLOW_ANON = os.environ.get("FISTBUMP_ALLOW_ANON", "0") == "1"
 
 
+def _split_version_platform(rest: str):
+    """Auth lines carry '<version> [platform]' — 1.7.28+ clients append their
+    platform tag; older clients send the bare version."""
+    parts = rest.strip().split()
+    version = parts[0] if parts else ""
+    platform = parts[1] if len(parts) > 1 else ""
+    return version, platform
+
+
 @dataclass
 class ClientSession:
     sid: str
@@ -303,6 +319,7 @@ class ClientSession:
     chat_token_bucket: float = 5.0  # tokens; 5 msgs/sec capacity
     chat_last_refill: float = 0.0
     force_relay: bool = False  # client opted to disable P2P (use server relay)
+    platform: str = ""  # client platform tag (windows/android/vita/...) — trailing auth field, 1.7.28+
 
 
 ROOM_MAX_MEMBERS = 8
@@ -332,6 +349,9 @@ class Room:
     # Empty-room grace: set when last member leaves; janitor reaps after
     # ROOM_EMPTY_TIMEOUT_S so user can soft-reset post-match and rejoin code.
     empty_since: Optional[float] = None
+    # Cumulative match wins per username for the lifetime of the room
+    # (multi-fight scoreboard, 1.7.28). Dies with the room.
+    scores: dict = field(default_factory=dict)
 
 
 def gen_room_code() -> str:
@@ -362,7 +382,7 @@ class PendingMatch:
 
 
 class FistbumpServer:
-    def __init__(self, tcp_port: int, udp_port: int, relay_port: int, host: str = "0.0.0.0", public_host: str = "127.0.0.1", upstream_url: Optional[str] = None):
+    def __init__(self, tcp_port: int, udp_port: int, relay_port: int, host: str = "0.0.0.0", public_host: str = "127.0.0.1", upstream_url: Optional[str] = None, region_code: str = "unknown"):
         self.host = host
         self.public_host = public_host
         self.tcp_port = tcp_port
@@ -372,6 +392,7 @@ class FistbumpServer:
         # instead of writing local users/matches DB. Used for edge regions sharing
         # a single source-of-truth leaderboard.
         self.upstream_url = upstream_url.rstrip("/") if upstream_url else None
+        self.region_code = region_code or "unknown"  # stamped on match records
         self.sessions: dict[str, ClientSession] = {}
         # match_uuid (str) -> {"1": (ip, port) | None, "2": (ip, port) | None}
         self.relay_routes: dict[str, dict[str, tuple]] = {}
@@ -413,6 +434,12 @@ class FistbumpServer:
                 completed_at INTEGER
             )
         """)
+        # Additive columns (1.7.28): where the match was played + on what.
+        for _col in ("region TEXT", "platform_a TEXT", "platform_b TEXT"):
+            try:
+                self.db.execute(f"ALTER TABLE matches ADD COLUMN {_col}")
+            except sqlite3.OperationalError:
+                pass  # already migrated
         self.db.commit()
         log.info("DB ready at %s", DB_PATH)
 
@@ -921,6 +948,7 @@ class FistbumpServer:
             s = self.sessions.get(sid) if sid else None
             return s.username if s else "-"
         members_str = ",".join(uname(sid) for sid in room.members) or "-"
+        scores_str = ",".join(f"{u}:{w}" for u, w in room.scores.items()) or "-"
         msg = (f"ROOM STATE {room.code} "
                f"host={uname(room.host_sid)} "
                f"best_of={room.settings_best_of} "
@@ -929,6 +957,7 @@ class FistbumpServer:
                f"slot_a={uname(room.slot_a)} "
                f"slot_b={uname(room.slot_b)} "
                f"match={room.current_match_id or '-'} "
+               f"scores={scores_str} "
                f"members={members_str}")
         for sid in list(room.members):
             s = self.sessions.get(sid)
@@ -958,12 +987,16 @@ class FistbumpServer:
         # Stash room code on the match so _after_match_finalize can find the
         # room without scanning every entry in self.rooms.
         pm.room_code = room.code  # type: ignore[attr-defined]
+        pm.platform_a = a.platform  # type: ignore[attr-defined]
+        pm.platform_b = b.platform  # type: ignore[attr-defined]
         self.matches[match_id] = pm
         room.current_match_id = match_id
         try:
             self.db.execute(
-                "INSERT INTO matches (id, p1, p2, created_at) VALUES (?, ?, ?, ?)",
-                (match_id, a.username, b.username, int(time.time())),
+                "INSERT INTO matches (id, p1, p2, created_at, region, platform_a, platform_b)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (match_id, a.username, b.username, int(time.time()),
+                 self.region_code, a.platform or None, b.platform or None),
             )
             self.db.commit()
         except Exception as e:
@@ -996,8 +1029,19 @@ class FistbumpServer:
             return
 
         m = self.matches.get(match_id)
-        if not m or m.finalized:
+        if not m:
             return
+        if m.finalized:
+            # In-game rematch: the session keeps playing under the same
+            # match_id and re-reports cumulative PL_Wins after every game.
+            # A report extending the already-counted totals reopens the
+            # match; the finalize path credits only the new game (delta).
+            counted = getattr(m, "counted", None) or (0, 0)
+            if (my_wins + opp_wins) <= (counted[0] + counted[1]):
+                return  # duplicate/stale report of an already-counted game
+            m.finalized = False
+            m.result_a = None
+            m.result_b = None
         if session.sid not in (m.sid_a, m.sid_b):
             log.warning("RESULT from wrong sid=%s for match=%s", session.sid, match_id)
             return
@@ -1034,6 +1078,14 @@ class FistbumpServer:
             return
 
         a_wins, b_wins = a_wins_a, b_wins_a
+        # Per-game crediting for in-game rematches: only the delta vs the
+        # already-counted totals decides this game's winner.
+        prev_counted = getattr(m, "counted", None) or (0, 0)
+        delta_a = a_wins - prev_counted[0]
+        delta_b = b_wins - prev_counted[1]
+        m.counted = (a_wins, b_wins)  # type: ignore[attr-defined]
+        game_winner = None if delta_a == delta_b else (m.user_a if delta_a > delta_b else m.user_b)
+        m.game_winner = game_winner  # type: ignore[attr-defined]
         if self.upstream_url:
             await self._upstream_post("/api/internal/result", {
                 "match_id": match_id,
@@ -1042,13 +1094,16 @@ class FistbumpServer:
                 "a_wins": a_wins,
                 "b_wins": b_wins,
                 "is_ranked": m.is_ranked,
+                "region": self.region_code,
+                "platform_a": getattr(m, "platform_a", "") or "",
+                "platform_b": getattr(m, "platform_b", "") or "",
             })
             m.finalized = True
             m.finalized_at = time.time()
             await self._after_match_finalize(m)
             return
-        if a_wins == b_wins:
-            # Tie — no ELO change
+        if game_winner is None:
+            # No new game to credit (tied first report, or stale duplicate).
             log.info("match %s ended as TIE", match_id)
             try:
                 self.db.execute(
@@ -1063,7 +1118,7 @@ class FistbumpServer:
             await self._after_match_finalize(m)
             return
 
-        winner = m.user_a if a_wins > b_wins else m.user_b
+        winner = game_winner
         loser = m.user_b if winner == m.user_a else m.user_a
         if m.is_ranked:
             await self._apply_elo(match_id, winner, loser)
@@ -1100,6 +1155,12 @@ class FistbumpServer:
             return
         if room.current_match_id == m.match_id:
             room.current_match_id = None
+        # Multi-fight scoreboard: credit the winner of the game that just
+        # finalized (delta-aware — in-game rematches re-finalize per game).
+        gw = getattr(m, "game_winner", None)
+        if gw:
+            room.scores[gw] = room.scores.get(gw, 0) + 1
+            m.game_winner = None  # consumed
         await self._broadcast_room_state(room)
 
     async def _apply_elo(self, match_id: str, winner: str, loser: str):
@@ -1195,7 +1256,7 @@ class FistbumpServer:
         return {
             "ok": True,
             "username": username,
-            "display": username[:7],
+            "display": username,
             "token": token,
             "expiry": expiry,
         }
@@ -1215,8 +1276,12 @@ class FistbumpServer:
         # inserted here). Insert lazily so completion writes succeed.
         try:
             self.db.execute(
-                "INSERT OR IGNORE INTO matches (id, p1, p2, created_at) VALUES (?, ?, ?, ?)",
-                (match_id, user_a, user_b, int(time.time())),
+                "INSERT OR IGNORE INTO matches (id, p1, p2, created_at, region, platform_a, platform_b)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (match_id, user_a, user_b, int(time.time()),
+                 body.get("region") or "unknown",
+                 body.get("platform_a") or None,
+                 body.get("platform_b") or None),
             )
             self.db.commit()
         except Exception as e:
@@ -1230,7 +1295,14 @@ class FistbumpServer:
             stub.started = True
             self.matches[match_id] = stub
         m_stub = self.matches.get(match_id)
-        if a_wins == b_wins:
+        prev_counted = (getattr(m_stub, "counted", None) or (0, 0)) if m_stub else (0, 0)
+        delta_a = a_wins - prev_counted[0]
+        delta_b = b_wins - prev_counted[1]
+        if m_stub is not None:
+            if (a_wins + b_wins) <= (prev_counted[0] + prev_counted[1]):
+                return {"ok": True, "winner": "DUPLICATE"}
+            m_stub.counted = (a_wins, b_wins)  # type: ignore[attr-defined]
+        if delta_a == delta_b:
             try:
                 self.db.execute(
                     "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
@@ -1244,7 +1316,7 @@ class FistbumpServer:
                 m_stub.finalized = True
                 m_stub.finalized_at = time.time()
             return {"ok": True, "winner": "TIE"}
-        winner = user_a if a_wins > b_wins else user_b
+        winner = user_a if delta_a > delta_b else user_b
         loser = user_b if winner == user_a else user_a
         if is_ranked:
             await self._apply_elo(match_id, winner, loser)
@@ -1321,7 +1393,7 @@ class FistbumpServer:
             await self.send(session, resp.get("reject") or "REJECT auth failed")
             return False
         username = resp["username"]
-        display = resp.get("display") or username[:7]
+        display = resp.get("display") or username
         token = resp["token"]
         expiry = resp["expiry"]
         session.username = username
@@ -1343,7 +1415,10 @@ class FistbumpServer:
         if len(parts) < 3:
             await self.send(session, "REJECT register requires: <username> <password> <version>")
             return
-        username, password, version = parts[0], parts[1], parts[2].strip()
+        username, password = parts[0], parts[1]
+        version, _plat = _split_version_platform(parts[2])
+        if _plat:
+            session.platform = _plat
         if not self._check_version(session, version):
             await self.send(session, f"REJECT version mismatch — allowed: {','.join(sorted(ALLOWED_VERSIONS))}")
             return
@@ -1380,7 +1455,10 @@ class FistbumpServer:
         if len(parts) < 3:
             await self.send(session, "REJECT login requires: <username> <password> <version>")
             return
-        username, password, version = parts[0], parts[1], parts[2].strip()
+        username, password = parts[0], parts[1]
+        version, _plat = _split_version_platform(parts[2])
+        if _plat:
+            session.platform = _plat
         if not self._check_version(session, version):
             await self.send(session, f"REJECT version mismatch — allowed: {','.join(sorted(ALLOWED_VERSIONS))}")
             return
@@ -1403,8 +1481,9 @@ class FistbumpServer:
         session.state = "logged_in"
         token, expiry = issue_token(username)
         await self.send(session, f"TOKEN refresh {token} {expiry}")
-        # Use 7-char display name (client limits PROFILE %7s)
-        display = username[:7]
+        # Full username — 1.7.28+ clients parse up to 63 chars; the room
+        # overlay compares it against ROOM STATE names for host/slot detection.
+        display = username
         await self.send(session, f"PROFILE {display}")
         await self._rebind_user_rooms(session)
 
@@ -1472,6 +1551,9 @@ class FistbumpServer:
 
     async def handle_hello(self, session: ClientSession, version: str):
         """Anonymous HELLO — only allowed when ALLOW_ANON. Otherwise must REGISTER/LOGIN."""
+        version, _plat = _split_version_platform(version)
+        if _plat:
+            session.platform = _plat
         ip = session.peername[0] if session.peername else "?"
         if not self._rate_check(ip, "hello", HELLO_RATE_LIMIT):
             self._register_reject(ip, "hello rate")
@@ -1496,6 +1578,9 @@ class FistbumpServer:
         await self.send(session, f"PROFILE {username[:7]}")
 
     async def handle_refresh(self, session: ClientSession, token: str, version: str):
+        version, _plat = _split_version_platform(version)
+        if _plat:
+            session.platform = _plat
         ip = session.peername[0] if session.peername else "?"
         if not self._rate_check(ip, "hello", HELLO_RATE_LIMIT):
             self._register_reject(ip, "refresh rate")
@@ -1575,15 +1660,20 @@ class FistbumpServer:
                 a.udp_endpoint = None
                 b.udp_endpoint = None
                 match_id = str(uuid.uuid4())
-                self.matches[match_id] = PendingMatch(
+                pm = PendingMatch(
                     match_id=match_id, sid_a=sid_a, sid_b=sid_b,
                     user_a=a.username, user_b=b.username,
                     is_ranked=is_ranked,
                 )
+                pm.platform_a = a.platform  # type: ignore[attr-defined]
+                pm.platform_b = b.platform  # type: ignore[attr-defined]
+                self.matches[match_id] = pm
                 try:
                     self.db.execute(
-                        "INSERT INTO matches (id, p1, p2, created_at) VALUES (?, ?, ?, ?)",
-                        (match_id, a.username, b.username, int(time.time())),
+                        "INSERT INTO matches (id, p1, p2, created_at, region, platform_a, platform_b)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (match_id, a.username, b.username, int(time.time()),
+                         self.region_code, a.platform or None, b.platform or None),
                     )
                     self.db.commit()
                 except Exception as e:
@@ -1893,6 +1983,25 @@ class FistbumpServer:
                     "tier": rank["tier"],
                     "sub": rank["sub"],
                 })
+            # Platforms + regions per player, from completed matches (1.7.28).
+            _PLAT_LABEL = {"windows": "PC", "macos": "PC", "linux": "PC",
+                           "android": "Android", "vita": "Vita"}
+            plat_map: dict = {}
+            reg_map: dict = {}
+            cur = self.db.execute(
+                "SELECT p1, platform_a, p2, platform_b, region FROM matches"
+                " WHERE completed_at IS NOT NULL")
+            for _p1, _pa, _p2, _pb, _reg in cur.fetchall():
+                if _pa:
+                    plat_map.setdefault(_p1, set()).add(_PLAT_LABEL.get(_pa, _pa))
+                if _pb:
+                    plat_map.setdefault(_p2, set()).add(_PLAT_LABEL.get(_pb, _pb))
+                if _reg and _reg != "unknown":
+                    reg_map.setdefault(_p1, set()).add(_reg)
+                    reg_map.setdefault(_p2, set()).add(_reg)
+            for entry in leaderboard:
+                entry["platforms"] = sorted(plat_map.get(entry["username"], ()))
+                entry["regions"] = sorted(reg_map.get(entry["username"], ()))
         except Exception as e:
             log.warning("leaderboard query failed: %s", e)
             total_users = 0
@@ -1927,10 +2036,12 @@ class FistbumpServer:
                 f'<td class="rnk" style="color:{color}">{_html.escape(p["rank"])}</td>'
                 f'<td class="elo">{elo_disp}</td>'
                 f'<td class="wl">{p["wins"]}W / {p["losses"]}L</td>'
-                f'<td class="wr">{wr}%</td></tr>'
+                f'<td class="wr">{wr}%</td>'
+                f'<td class="plat">{_html.escape(" / ".join(p.get("platforms", [])) or "—")}</td>'
+                f'<td class="reg">{_html.escape(" / ".join(p.get("regions", [])) or "—")}</td></tr>'
             )
         rows_html = "\n".join(rows) if rows else (
-            '<tr><td colspan="6" class="empty">No matches played yet — be the first!</td></tr>'
+            '<tr><td colspan="8" class="empty">No matches played yet — be the first!</td></tr>'
         )
         return BASE_HTML.format(
             title="3SX Netplay — Rollback online for Street Fighter III",
@@ -1977,6 +2088,8 @@ class FistbumpServer:
   <th>ELO</th>
   <th><span data-i18n-en>Record</span><span data-i18n-es>Récord</span></th>
   <th><span data-i18n-en>WR</span><span data-i18n-es>WR</span></th>
+  <th><span data-i18n-en>Platforms</span><span data-i18n-es>Plataformas</span></th>
+  <th><span data-i18n-en>Regions</span><span data-i18n-es>Regiones</span></th>
 </tr></thead>
 <tbody>{rows_html}</tbody></table>
 
@@ -2674,6 +2787,8 @@ def main():
                    help="If set, proxies auth + match results to this base URL. "
                         "Edge regions use this to share a single source-of-truth "
                         "leaderboard hosted by the leader region.")
+    p.add_argument("--region-code", default="unknown",
+                   help="Region tag stamped on match records (e.g. us-east-1)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -2683,7 +2798,7 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    srv = FistbumpServer(args.tcp_port, args.udp_port, args.relay_port, args.host, args.public_host, args.upstream_url)
+    srv = FistbumpServer(args.tcp_port, args.udp_port, args.relay_port, args.host, args.public_host, args.upstream_url, args.region_code)
     try:
         asyncio.run(srv.run())
     except KeyboardInterrupt:

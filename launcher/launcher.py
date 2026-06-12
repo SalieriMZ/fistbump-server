@@ -25,8 +25,8 @@ from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Optional
 
-APP_VERSION = "1.7.27"  # launcher version (this Python app + UI)
-GAME_VERSION = "1.6.9"  # game build packaged in this launcher's zip (3sx.exe content)
+APP_VERSION = "1.7.28"  # launcher version (this Python app + UI)
+GAME_VERSION = "1.7.28"  # game build packaged in this launcher's zip (3sx.exe content)
 
 # Verbose mode: print discovered paths, env vars, and the exact args used to
 # launch the game. Toggle with `--verbose` / `-v` on the command line or via

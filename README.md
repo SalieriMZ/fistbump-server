@@ -44,7 +44,7 @@ then attach raw TCP clients:
 
 ```sh
 nc localhost 9000
-> HELLO 1.3.0
+> HELLO 1.3.1
 < SESSION <sid>
 > QUEUE casual
 ...
@@ -86,8 +86,8 @@ Copy `nginx/fistbump.example.com.conf.example` to your sites-enabled, replace th
 
 ```sh
 source publish_update.env   # copy from publish_update.env.example, fill in
-bash publish_update.sh 1.7.27 dist/3sx-1.7.27.zip stable
-bash publish_update.sh 1.7.27 dist/3sx-1.7.27.zip beta
+bash publish_update.sh 1.7.28 dist/3sx-1.7.28.zip stable
+bash publish_update.sh 1.7.28 dist/3sx-1.7.28.zip beta
 ```
 
 The launcher under `launcher/` is bundled into each desktop build by `build_dist.sh`. Bump `launcher/launcher.py` `APP_VERSION` + `server.py` `ALLOWED_VERSIONS` in lockstep.
