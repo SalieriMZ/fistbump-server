@@ -266,7 +266,7 @@ MATCH_PUNCH_TIMEOUT_S = 20  # peers have 20s to UDP-punch (accept) after MATCH
 FINALIZE_GRACE_S = 1800  # keep finalized match relay alive 30min for REMATCH; auto-refreshes per UDP packet in handle_relay
 
 # Allowed client versions. Add new ones here when bumping.
-ALLOWED_VERSIONS = {"1.3.0", "1.6.4", "1.6.5", "1.6.6", "1.6.7", "1.6.8", "1.6.9", "1.7.0", "1.7.1", "1.7.2", "1.7.3", "1.7.4", "1.7.5", "1.7.6", "1.7.7", "1.7.8", "1.7.9", "1.7.10", "1.7.11", "1.7.12", "1.7.13", "1.7.14", "1.7.15", "1.7.16", "1.7.17", "1.7.18", "1.7.19", "1.7.20", "1.7.21", "1.7.22", "1.7.23", "1.7.24", "1.7.25", "1.7.26"}  # 1.3.0 = game protocol; 1.6.x..1.7.x = launcher
+ALLOWED_VERSIONS = {"1.3.0", "1.6.4", "1.6.5", "1.6.6", "1.6.7", "1.6.8", "1.6.9", "1.7.0", "1.7.1", "1.7.2", "1.7.3", "1.7.4", "1.7.5", "1.7.6", "1.7.7", "1.7.8", "1.7.9", "1.7.10", "1.7.11", "1.7.12", "1.7.13", "1.7.14", "1.7.15", "1.7.16", "1.7.17", "1.7.18", "1.7.19", "1.7.20", "1.7.21", "1.7.22", "1.7.23", "1.7.24", "1.7.25", "1.7.26", "1.7.27"}  # 1.3.0 = game protocol; 1.6.x..1.7.x = launcher
 
 ALLOWED_CHAT_SCOPES = {"general", "match", "room"}
 MAX_CHAT_LEN = 256
