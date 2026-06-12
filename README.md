@@ -104,9 +104,6 @@ build_dist.sh              Build 3sx.exe + slim launcher + bootstrap → dist/.
 Dockerfile                 Alpine + python3 + server.py copy.
 nginx/                     Reverse-proxy template.
 launcher/                  Tk-based desktop launcher (Play + auto-update).
-client-patches/            Numbered patches that wire netplay into the
-                           upstream crowded-street/3sx client source tree.
-client.patch               Aggregated single-diff of the same patches.
 ```
 
 ## Configuration
