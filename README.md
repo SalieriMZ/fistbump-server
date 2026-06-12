@@ -120,7 +120,7 @@ launcher/                  Tk-based desktop launcher (Play + auto-update).
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+AGPL-3.0 — same as the [3sx-online](https://github.com/SalieriMZ/3sx-online) client. See [`LICENSE`](LICENSE).
 
 ## Acknowledgements
 
