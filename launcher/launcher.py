@@ -618,33 +618,25 @@ class LauncherApp:
                         command=self._save_telemetry).grid(
             row=adv_row + 5, column=0, columnspan=2, sticky="w", **pad)
 
-        # Release channel selector (stable / beta). Beta = preview builds.
-        ttk.Label(frame, text="Release channel").grid(row=adv_row + 6, column=0, sticky="w", **pad)
-        saved_channel = self.cfg.get("channel", DEFAULT_CHANNEL)
-        if saved_channel not in RELEASE_CHANNELS:
-            saved_channel = DEFAULT_CHANNEL
-        self.channel_var = tk.StringVar(value=saved_channel)
-        channel_combo = ttk.Combobox(frame, textvariable=self.channel_var,
-                                     values=list(RELEASE_CHANNELS),
-                                     state="readonly", width=24)
-        channel_combo.grid(row=adv_row + 6, column=1, sticky="w", **pad)
-        channel_combo.bind("<<ComboboxSelected>>", lambda e: self._save_channel())
+        # (Release-channel selector removed: the shipped launcher updates from
+        # GitHub Releases /latest, which has no per-channel concept, so the old
+        # stable/beta combobox was a no-op. The legacy self-hosted manifest path
+        # still defaults to the stable channel via DEFAULT_CHANNEL.)
 
         ttk.Button(frame, text="Open log folder",
                    command=lambda: subprocess.Popen(["explorer", str(CONFIG_DIR)])).grid(
-            row=adv_row + 7, column=0, pady=20, padx=20, sticky="w")
+            row=adv_row + 6, column=0, pady=20, padx=20, sticky="w")
 
         ttk.Label(frame,
-                  text="GPU / Channel / Telemetry auto-save on change.\n"
+                  text="GPU / Telemetry auto-save on change.\n"
                        "GPU picker forces Vulkan loader to one vendor — fixes\n"
                        "dual-GPU crash. Pick NVIDIA on laptops with iGPU+dGPU.\n"
-                       "Channel beta gets new features before stable.\n"
                        "Telemetry uploads netplay.log + console.log every 30s while logged in.\n"
                        "Region / Force-relay / account / chat / FPS / HUD live in\n"
                        "the in-game overlay (3SX Account modal + F3 settings + Tab chat).",
                   foreground="#8b949e",
                   font=("Segoe UI", 9, "italic")).grid(
-            row=adv_row + 8, column=0, columnspan=3, sticky="w", **pad)
+            row=adv_row + 7, column=0, columnspan=3, sticky="w", **pad)
 
     def _on_region_change(self):
         sel = self.region_var.get().split(" — ")[0]
@@ -674,14 +666,6 @@ class LauncherApp:
         self.cfg["vulkan_icd"] = icd_path
         save_launcher_config(self.cfg)
         self.status_var.set(f"GPU: {label} (saved)")
-
-    def _save_channel(self):
-        ch = self.channel_var.get()
-        if ch not in RELEASE_CHANNELS:
-            ch = DEFAULT_CHANNEL
-        self.cfg["channel"] = ch
-        save_launcher_config(self.cfg)
-        self.status_var.set(f"Channel: {ch} (saved) — restart launcher to apply")
 
     def _save_telemetry(self):
         v = bool(self.telemetry_var.get())

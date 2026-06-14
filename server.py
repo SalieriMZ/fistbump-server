@@ -2149,12 +2149,14 @@ class FistbumpServer:
 
 <div class="footer">
   <p><span data-i18n-en>Open source · </span><span data-i18n-es>Código abierto · </span>
-     <a href="https://github.com/crowded-street/3sx-netplay">GitHub</a> ·
+     <a href="https://github.com/SalieriMZ/3sx-online">GitHub</a> ·
+     <a href="https://discord.gg/aume4RqnnP">Discord</a> ·
      <a href="/watch"><span data-i18n-en>Live Matches</span><span data-i18n-es>Peleas en Vivo</span></a> ·
      <a href="/api">JSON API</a> ·
      <a href="/metrics">Metrics</a></p>
   <p style="margin-top:.5rem;font-size:.8rem">
-    <span data-i18n-en>Based on </span><span data-i18n-es>Basado en </span>
+    <span data-i18n-en>Independent community project — not affiliated with Capcom or crowded-street. Based on </span>
+    <span data-i18n-es>Proyecto comunitario independiente — sin afiliación con Capcom ni crowded-street. Basado en </span>
     <a href="https://github.com/crowded-street/3sx">crowded-street/3sx</a>.
     <span data-i18n-en>Game assets © Capcom. ROM required (not distributed).</span>
     <span data-i18n-es>Assets del juego © Capcom. ROM requerida (no se distribuye).</span>
