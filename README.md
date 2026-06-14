@@ -82,15 +82,20 @@ Copy `nginx/fistbump.example.com.conf.example` to your sites-enabled, replace th
 
 ## Publishing client updates
 
-`publish_update.sh` SCPs a `3sx-x.y.z.zip` + new `<channel>.json` manifest to the server. Required env vars: `HOST`, `PUBLIC_BASE_URL`. Optional: `SSH_KEY`, `REMOTE_DIR`.
+The launcher updates **only from GitHub Releases** — it polls the public repo's
+`releases/latest`, compares the tag against the installed `VERSION`, and prompts
+the player to re-download the zip from github.com (HTTPS, public checksums). The
+matchmaking host never serves game binaries: cut a GitHub release (`stable-x.y.z`,
+marked *Latest*) and existing installs pick it up automatically.
 
-```sh
-source publish_update.env   # copy from publish_update.env.example, fill in
-bash publish_update.sh 1.7.28 dist/3sx-1.7.28.zip stable
-bash publish_update.sh 1.7.28 dist/3sx-1.7.28.zip beta
-```
+Bump `launcher/launcher.py` `APP_VERSION` + `server.py` `ALLOWED_VERSIONS` in
+lockstep so the new launcher's login is accepted.
 
-The launcher under `launcher/` is bundled into each desktop build by `build_dist.sh`. Bump `launcher/launcher.py` `APP_VERSION` + `server.py` `ALLOWED_VERSIONS` in lockstep.
+> **Legacy self-hosted channel (deprecated, off by default).** `publish_update.sh`
+> SCPs a zip + `<channel>.json` manifest to a server for forks that prefer an
+> in-place updater. The shipped launcher ignores it; it only activates if a fork
+> sets `FISTBUMP_SERVER_BASE_URL` *and* re-adds a manifest update path. Not used
+> by the reference deployment — we keep updates on GitHub on purpose.
 
 ## Repo layout
 

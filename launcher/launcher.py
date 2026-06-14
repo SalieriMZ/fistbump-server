@@ -25,8 +25,8 @@ from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Optional
 
-APP_VERSION = "1.7.28"  # launcher version (this Python app + UI)
-GAME_VERSION = "1.7.28"  # game build packaged in this launcher's zip (3sx.exe content)
+APP_VERSION = "1.7.29"  # launcher version (this Python app + UI)
+GAME_VERSION = "1.7.29"  # game build packaged in this launcher's zip (3sx.exe content)
 
 # Verbose mode: print discovered paths, env vars, and the exact args used to
 # launch the game. Toggle with `--verbose` / `-v` on the command line or via
@@ -180,26 +180,15 @@ def _detect_vulkan_icds() -> list:
 
     return results
 
+# Base URL of the community server, used for log-telemetry uploads and the
+# "open website" button only — NOT for updates. Updates come exclusively from
+# the GitHub Releases page of the public repo (see _check_update): no game
+# binary is ever served off the matchmaking host, by design.
 UPDATE_BASE_URL = os.environ.get(
-    "FISTBUMP_UPDATE_BASE_URL",
+    "FISTBUMP_SERVER_BASE_URL",
     f"http://{DEFAULT_SERVER}:{DEFAULT_PORT + 1000}",
 )
-RELEASE_CHANNELS = ("stable", "beta")
-DEFAULT_CHANNEL = "stable"
-
-# Update source. Default: the GitHub Releases page of the public repo —
-# players re-download from github.com (HTTPS, public checksums) instead of
-# pulling zips off the matchmaking host. Forks that self-host a manifest
-# channel can set FISTBUMP_UPDATE_BASE_URL to restore the legacy in-place
-# updater (UPDATE_BASE_URL is still used for log telemetry either way).
-UPDATE_USE_MANIFEST = "FISTBUMP_UPDATE_BASE_URL" in os.environ
 UPDATE_REPO = os.environ.get("FISTBUMP_UPDATE_REPO", "SalieriMZ/3sx-online")
-
-
-def update_manifest_url(channel: str) -> str:
-    if channel not in RELEASE_CHANNELS:
-        channel = DEFAULT_CHANNEL
-    return f"{UPDATE_BASE_URL}/api/update/{channel}.json"
 
 
 def _resolve_default_exe() -> str:
@@ -618,10 +607,9 @@ class LauncherApp:
                         command=self._save_telemetry).grid(
             row=adv_row + 5, column=0, columnspan=2, sticky="w", **pad)
 
-        # (Release-channel selector removed: the shipped launcher updates from
-        # GitHub Releases /latest, which has no per-channel concept, so the old
-        # stable/beta combobox was a no-op. The legacy self-hosted manifest path
-        # still defaults to the stable channel via DEFAULT_CHANNEL.)
+        # (Release-channel selector removed: updates come only from GitHub
+        # Releases /latest, which has no per-channel concept, so the old
+        # stable/beta combobox was a no-op.)
 
         ttk.Button(frame, text="Open log folder",
                    command=lambda: subprocess.Popen(["explorer", str(CONFIG_DIR)])).grid(
@@ -788,26 +776,9 @@ class LauncherApp:
     def _check_update(self):
         """Worker thread: check for a newer release, prompt on main thread."""
         local = self._installed_version()
-        if UPDATE_USE_MANIFEST:
-            # Legacy self-hosted channel (FISTBUMP_UPDATE_BASE_URL set).
-            channel = self.cfg.get("channel", DEFAULT_CHANNEL)
-            if channel not in RELEASE_CHANNELS:
-                channel = DEFAULT_CHANNEL
-            try:
-                req = urllib.request.Request(update_manifest_url(channel))
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    manifest = json.loads(r.read().decode("utf-8"))
-            except Exception:
-                return  # silent — never block login on a flaky update server
-            srv_version = str(manifest.get("version", "")).strip()
-            if not srv_version:
-                return
-            if self._parse_version(srv_version) <= self._parse_version(local):
-                return
-            self.root.after(0, lambda: self._prompt_update(manifest))
-            return
-
-        # Default: GitHub Releases. Players re-download from github.com.
+        # Updates come only from GitHub Releases — players re-download from
+        # github.com (HTTPS, public checksums). We deliberately do not pull
+        # game binaries off the matchmaking host.
         try:
             req = urllib.request.Request(
                 f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
@@ -865,116 +836,6 @@ class LauncherApp:
                     req = urllib.request.Request(url, data=data, method="POST",
                                                  headers={"Content-Type": "text/plain"})
                     urllib.request.urlopen(req, timeout=10).read()
-                except Exception:
-                    pass
-
-    def _prompt_update(self, manifest):
-        version = manifest.get("version", "?")
-        if not messagebox.askyesno(
-            "Update available",
-            f"3SX {version} is available. Install now?\n\n"
-            "The launcher will close after installing -- re-open 3SX.exe to launch the new version."
-        ):
-            return
-        threading.Thread(target=self._do_update, args=(manifest,), daemon=True).start()
-
-    def _update_error(self, msg: str):
-        self.root.after(0, lambda: messagebox.showerror("Update failed", msg))
-
-    def _do_update(self, manifest):
-        version = str(manifest["version"])
-        url = str(manifest["payload"]["url"])
-        expected_sha = str(manifest["payload"]["sha256"]).lower()
-
-        install_root = self._install_root()
-        staging = install_root / "updates"
-        staging.mkdir(parents=True, exist_ok=True)
-        partial = staging / f"{version}.partial"
-        final_zip = staging / f"{version}.zip"
-
-        h = hashlib.sha256()
-        try:
-            with urllib.request.urlopen(url, timeout=60) as r, open(partial, "wb") as out:
-                while True:
-                    chunk = r.read(64 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    h.update(chunk)
-        except Exception as e:
-            self._update_error(f"Download failed: {e}")
-            try:
-                partial.unlink()
-            except FileNotFoundError:
-                pass
-            return
-
-        if h.hexdigest() != expected_sha:
-            try:
-                partial.unlink()
-            except FileNotFoundError:
-                pass
-            self._update_error("Update integrity check failed (SHA mismatch).")
-            return
-
-        if final_zip.exists():
-            final_zip.unlink()
-        partial.rename(final_zip)
-
-        versions_dir = install_root / "versions"
-        versions_dir.mkdir(exist_ok=True)
-        new_part = versions_dir / f"{version}.partial"
-        new_final = versions_dir / version
-        if new_part.exists():
-            shutil.rmtree(new_part)
-        new_part.mkdir()
-        try:
-            with zipfile.ZipFile(final_zip) as zf:
-                zf.extractall(new_part)
-        except Exception as e:
-            shutil.rmtree(new_part, ignore_errors=True)
-            self._update_error(f"Extract failed: {e}")
-            return
-        if new_final.exists():
-            shutil.rmtree(new_final)
-        new_part.rename(new_final)
-
-        # Some publish layouts have versions/<ver>/versions/<ver>/... (because the
-        # zip itself contains a top-level versions/). Detect + flatten.
-        nested = new_final / "versions" / version
-        if nested.exists() and (nested / "3sx.exe").exists():
-            tmp_move = versions_dir / f"{version}.flatten"
-            if tmp_move.exists():
-                shutil.rmtree(tmp_move)
-            nested.rename(tmp_move)
-            shutil.rmtree(new_final)
-            tmp_move.rename(new_final)
-
-        cur_file = install_root / "current.txt"
-        rb_file = install_root / "rollback.txt"
-        prev = cur_file.read_text(encoding="utf-8").strip() if cur_file.exists() else ""
-        tmp_cur = install_root / "current.txt.tmp"
-        tmp_cur.write_text(version, encoding="utf-8")
-        if prev:
-            rb_file.write_text(prev, encoding="utf-8")
-        if cur_file.exists():
-            cur_file.unlink()
-        tmp_cur.rename(cur_file)
-
-        self._prune_versions(versions_dir, keep={version, prev})
-
-        self.root.after(0, lambda: messagebox.showinfo(
-            "Update installed",
-            f"3SX {version} installed. Close this dialog, then re-open 3SX.exe to relaunch."
-        ))
-        self.root.after(100, self.root.quit)
-
-    def _prune_versions(self, versions_dir, keep):
-        keep = {v for v in keep if v}
-        for entry in versions_dir.iterdir():
-            if entry.is_dir() and entry.name not in keep and not entry.name.endswith(".partial"):
-                try:
-                    shutil.rmtree(entry)
                 except Exception:
                     pass
 

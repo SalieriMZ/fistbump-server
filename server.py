@@ -273,7 +273,7 @@ FINALIZE_GRACE_S = 1800  # keep finalized match relay alive 30min for REMATCH; a
 # the platform auth field, full-length PROFILE usernames, and the ROOM STATE
 # scores token; older clients half-work, so they are rejected and the
 # launcher's update prompt walks them to the current release.
-ALLOWED_VERSIONS = {"1.3.1", "1.7.28"}  # 1.3.1 = game protocol; 1.7.28 = launcher
+ALLOWED_VERSIONS = {"1.3.1", "1.7.29"}  # 1.3.1 = game protocol (unchanged since 1.7.28); 1.7.29 = launcher
 
 ALLOWED_CHAT_SCOPES = {"general", "match", "room"}
 MAX_CHAT_LEN = 256

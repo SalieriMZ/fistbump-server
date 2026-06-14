@@ -1,0 +1,65 @@
+145 INFO: PyInstaller: 6.20.0, contrib hooks: 2026.6
+145 INFO: Python: 3.12.4
+186 INFO: Platform: Windows-11-10.0.26100-SP0
+186 INFO: Python environment: C:\Users\Sebastian Alvarez\AppData\Local\Programs\Python\Python312
+190 INFO: Module search paths (PYTHONPATH):
+['C:\\Users\\Sebastian '
+ 'Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Scripts\\pyinstaller.exe',
+ 'C:\\Users\\Sebastian '
+ 'Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\python312.zip',
+ 'C:\\Users\\Sebastian '
+ 'Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\DLLs',
+ 'C:\\Users\\Sebastian '
+ 'Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib',
+ 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312',
+ 'C:\\Users\\Sebastian '
+ 'Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages',
+ 'C:\\Users\\Sebastian Alvarez\\Documents\\3SX\\src\\fistbump-server\\launcher']
+458 INFO: checking Analysis
+468 INFO: Building because C:\Users\Sebastian Alvarez\Documents\3SX\src\fistbump-server\launcher\launcher.py changed
+468 INFO: Looking for Python shared library...
+468 INFO: Using Python shared library: C:\Users\Sebastian Alvarez\AppData\Local\Programs\Python\Python312\python312.dll
+468 INFO: Running Analysis Analysis-00.toc
+468 INFO: Target bytecode optimization level: 0
+468 INFO: Initializing module dependency graph...
+468 INFO: Initializing module graph hook caches...
+482 INFO: Analyzing modules for base_library.zip ...
+1522 INFO: Processing standard module hook 'hook-heapq.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+1585 INFO: Processing standard module hook 'hook-encodings.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+3099 INFO: Processing standard module hook 'hook-pickle.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+4186 INFO: Caching module dependency graph...
+4217 INFO: Analyzing C:\Users\Sebastian Alvarez\Documents\3SX\src\fistbump-server\launcher\launcher.py
+4259 INFO: Processing pre-find-module-path hook 'hook-tkinter.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+4260 INFO: TclTkInfo: initializing cached Tcl/Tk info...
+4456 INFO: Processing standard module hook 'hook-_tkinter.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+4688 INFO: Processing standard module hook 'hook-_ctypes.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+4722 INFO: Processing module hooks (post-graph stage)...
+4726 INFO: Processing standard module hook 'hook-_tkinter.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+4735 INFO: Performing binary vs. data reclassification (924 entries)
+4764 INFO: Looking for ctypes DLLs
+4774 INFO: Analyzing run-time hooks ...
+4775 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+4778 INFO: Including run-time hook 'pyi_rth__tkinter.py' from 'C:\\Users\\Sebastian Alvarez\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+4799 INFO: Creating base_library.zip...
+4818 INFO: Looking for dynamic libraries
+4925 INFO: Extra DLL search directories (AddDllDirectory): []
+4925 INFO: Extra DLL search directories (PATH): []
+5059 INFO: Warnings written to C:\Users\Sebastian Alvarez\Documents\3SX\src\fistbump-server\launcher\build\3sx_launcher_online\warn-3sx_launcher_online.txt
+5072 INFO: Graph cross-reference written to C:\Users\Sebastian Alvarez\Documents\3SX\src\fistbump-server\launcher\build\3sx_launcher_online\xref-3sx_launcher_online.html
+5098 INFO: checking PYZ
+5111 INFO: checking PKG
+5118 INFO: Building because toc changed
+5118 INFO: Building PKG (CArchive) 3sx_launcher_online.pkg
+7675 INFO: Building PKG (CArchive) 3sx_launcher_online.pkg completed successfully.
+7695 INFO: Bootloader C:\Users\Sebastian Alvarez\AppData\Local\Programs\Python\Python312\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+7696 INFO: checking EXE
+7704 INFO: Building because toc changed
+7705 INFO: Building EXE from EXE-00.toc
+7706 INFO: Copying bootloader EXE to C:\Users\Sebastian Alvarez\Documents\3SX\src\fistbump-server\launcher\dist\3sx_launcher_online.exe
+7710 INFO: Copying icon to EXE
+7711 INFO: Copying 0 resources to EXE
+7713 INFO: Embedding manifest in EXE
+7714 INFO: Appending PKG archive to EXE
+7720 INFO: Fixing EXE headers
+7790 INFO: Building EXE from EXE-00.toc completed successfully.
+7804 INFO: Build complete! The results are available in: C:\Users\Sebastian Alvarez\Documents\3SX\src\fistbump-server\launcher\dist
