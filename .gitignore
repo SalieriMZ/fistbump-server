@@ -7,7 +7,4 @@ token_secret
 bans.json
 .venv/
 .env
-launcher/build/
-launcher/dist/
-launcher/*.spec
 .test-room-e2e/

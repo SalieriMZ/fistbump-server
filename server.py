@@ -199,6 +199,20 @@ def get_internal_secret() -> str:
 
 INTERNAL_SECRET = get_internal_secret()
 
+# Inter-server request signing. The static Bearer has no replay protection; this
+# adds an HMAC over (path, timestamp, body) so a captured /api/internal request
+# can't be replayed or forged without the shared secret. Tolerant by
+# default — the verifier checks a signature only when one is present — so a
+# half-deployed fleet keeps working; set FISTBUMP_REQUIRE_HMAC=1 once every node
+# signs to make it mandatory. (Also IP-restrict /api/internal at nginx/firewall.)
+REQUIRE_INTERNAL_HMAC = os.environ.get("FISTBUMP_REQUIRE_HMAC", "0") == "1"
+INTERNAL_HMAC_WINDOW_S = 300  # reject signed requests older/newer than this
+
+
+def internal_sign(path: str, timestamp: str, body: bytes) -> str:
+    msg = path.encode("utf-8") + b"\n" + timestamp.encode("utf-8") + b"\n" + body
+    return hmac.new(INTERNAL_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
 
 def hash_password(password: str, salt: bytes = None) -> str:
     """PBKDF2-SHA256 password hash. Returns 'salt$hash' hex."""
@@ -269,11 +283,41 @@ QUEUE_IDLE_TIMEOUT_S = 300  # 5 min — kick idle queued clients
 MATCH_PUNCH_TIMEOUT_S = 20  # peers have 20s to UDP-punch (accept) after MATCH
 FINALIZE_GRACE_S = 1800  # keep finalized match relay alive 30min for REMATCH; auto-refreshes per UDP packet in handle_relay
 
-# Allowed client versions — latest release only. The 1.7.28 protocol added
-# the platform auth field, full-length PROFILE usernames, and the ROOM STATE
-# scores token; older clients half-work, so they are rejected and the
-# launcher's update prompt walks them to the current release.
-ALLOWED_VERSIONS = {"1.3.1", "1.7.29"}  # 1.3.1 = game protocol (unchanged since 1.7.28); 1.7.29 = launcher
+# Defense-in-depth cap on relay datagrams forwarded per side per second. The
+# relay carries the GekkoNet rollback stream (~60-120 pkt/s/side typical), so
+# this is ~10x headroom — its only job is to bound a flood / amplification, not
+# to shape normal play.
+RELAY_RATE_MAX_PER_SEC = 1000
+
+# Leaderboard aggregation is DB-heavy (scans completed matches). Cache the built
+# dict for this long so a flood of unauthenticated GET / can't re-run the scan
+# on every request.
+STATS_CACHE_TTL_S = 5
+
+# Hard ceiling on the cumulative games credited under a single match_id. Each
+# RESULT report carries cumulative PL_Wins (0..9 each), and only the delta vs
+# the already-counted totals is credited per game; this bounds total credited
+# games so a re-finalization loop can't inflate ELO/wins.
+MAX_COUNTED_GAMES = 18
+
+# Cap on the total size of the (unauthenticated) /api/logs upload directory.
+LOG_DIR_MAX_BYTES = 256 * 1024 * 1024
+
+# Allowed client versions — the current protocol only. Release 1.8.0 cut the
+# protocol to 1.4.0 (native cross-platform online UI + in-game update check);
+# every older client is rejected and prompted to update by the in-game check.
+ALLOWED_VERSIONS = {"1.4.0"}  # 1.4.0 = game protocol (release 1.8.0)
+
+# Newest shipped client release, reported to the in-game update check (the
+# VERSION command). The client has no TLS so it can't hit api.github.com
+# directly — it asks the server over the existing TCP line protocol, pre-auth.
+LATEST_CLIENT_VERSION = "1.8.0"
+UPDATE_RELEASES_URL = "https://github.com/SalieriMZ/3sx-online/releases/latest"
+
+# This broker's own version, reported to the client in the SESSION line so the
+# in-game UI can display the connected server's version. Additive token — older
+# clients parse only the session id and ignore it.
+SERVER_VERSION = "1.8.0"
 
 ALLOWED_CHAT_SCOPES = {"general", "match", "room"}
 MAX_CHAT_LEN = 256
@@ -320,6 +364,7 @@ class ClientSession:
     chat_last_refill: float = 0.0
     force_relay: bool = False  # client opted to disable P2P (use server relay)
     platform: str = ""  # client platform tag (windows/android/vita/...) — trailing auth field, 1.7.28+
+    is_anon: bool = False  # ephemeral anonymous login (no DB row, no ELO) — explicit flag, not a username-prefix guess
 
 
 ROOM_MAX_MEMBERS = 8
@@ -406,11 +451,39 @@ class FistbumpServer:
         self.bans: dict[str, str] = {}  # ip -> reason
         self.rate_history: dict[str, dict[str, list[float]]] = {}  # ip -> {"connect": [...], "hello": [...], "queue": [...]}
         self.reject_count: dict[str, int] = {}  # ip -> count (for auto-ban escalation)
+        # Leaderboard stats cache: the DB-heavy aggregation runs in a worker
+        # thread (own connection) and is TTL-cached so a GET / flood can't
+        # restart the scan on every request.
+        self._stats_cache: Optional[dict] = None
+        self._stats_cache_at: float = 0.0
+        # Serializes the off-loop DB WRITES (see _db_write) so two worker threads
+        # never write the shared connection at once. Loop-side inline reads/writes
+        # are NOT under this lock — they stay correct via SQLite Serialized mode
+        # (sqlite3.threadsafety==3), checked in _init_db.
+        self._db_lock = asyncio.Lock()
         self._load_bans()
         self._init_db()
 
     def _init_db(self):
-        self.db = sqlite3.connect(DB_PATH)
+        # check_same_thread=False so the result/ELO/match-INSERT commits can run
+        # in asyncio.to_thread worker threads (see _db_write) instead of fsync'ing
+        # inline on the event loop. The shared connection is then touched by both
+        # worker threads (offloaded writes) and the event-loop thread (inline
+        # reads like db_get_user + the stats HTTP pages, plus a few small auth-row
+        # writes). _db_lock serializes the worker WRITES against each other; the
+        # remaining loop/worker overlap on the one connection is memory-safe ONLY
+        # under SQLite Serialized mode (sqlite3.threadsafety==3, stock CPython's
+        # build), where SQLite holds a per-connection mutex. Worst case is
+        # cosmetic: a stats page read interleaved mid-write observes
+        # committed-or-prior rows, never partial/corrupt state. Warn loudly if a
+        # future runtime ships a threadsafety<3 build instead of garbling silently.
+        if sqlite3.threadsafety < 3:
+            log.warning(
+                "sqlite3.threadsafety=%d (<3, not Serialized): off-loop DB writes "
+                "share a connection with loop reads and may be unsafe on this "
+                "runtime; expected stock CPython (threadsafety=3).",
+                sqlite3.threadsafety)
+        self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
@@ -440,6 +513,21 @@ class FistbumpServer:
                 self.db.execute(f"ALTER TABLE matches ADD COLUMN {_col}")
             except sqlite3.OperationalError:
                 pass  # already migrated
+        # Index the leaderboard scan's filter column so the per-request
+        # completed-match aggregation (and /metrics counts) don't full-scan.
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_matches_completed ON matches(completed_at)")
+        # WAL lets the read-only leaderboard connection (built off the event
+        # loop in a worker thread — see _build_leaderboard_blocking) read
+        # concurrently with the loop's writes without 'database is locked'.
+        try:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
+            # Tolerate transient lock contention (the leaderboard build opens its
+            # own connection) instead of raising 'database is locked'.
+            self.db.execute("PRAGMA busy_timeout=3000")
+        except sqlite3.OperationalError as e:
+            log.warning("could not set WAL: %s", e)
         self.db.commit()
         log.info("DB ready at %s", DB_PATH)
 
@@ -457,6 +545,31 @@ class FistbumpServer:
     def db_touch_login(self, username: str):
         self.db.execute("UPDATE users SET last_login_at=? WHERE username=?", (int(time.time()), username))
         self.db.commit()
+
+    # PBKDF2 at 200k iterations is tens of ms of pure CPU; running it inline on
+    # the event loop lets a LOGIN/REGISTER flood stall all matchmaking (audit
+    # 4.2). These wrappers push the hashing onto a worker thread. The DB write
+    # itself stays on the loop (fast, indexed) to keep self.db single-threaded.
+    async def _verify_password_async(self, password: str, stored: str) -> bool:
+        return await asyncio.to_thread(verify_password, password, stored)
+
+    async def _create_user_async(self, username: str, password: str):
+        password_hash = await asyncio.to_thread(hash_password, password)
+        self.db.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username, password_hash, int(time.time())),
+        )
+        self.db.commit()
+
+    async def _db_write(self, fn):
+        """Run a cohesive execute(s)+commit() unit off the event loop. Under WAL
+        each commit() fsyncs and can stall the relay forward (end-of-round
+        stutters/disconnects); pushing the write to a worker thread keeps the
+        loop responsive. The lock serializes these worker-thread
+        writes against each other; safety of the remaining loop/worker overlap on
+        the shared connection rests on SQLite Serialized mode — see _init_db."""
+        async with self._db_lock:
+            return await asyncio.to_thread(fn)
 
     def _load_bans(self):
         try:
@@ -554,8 +667,9 @@ class FistbumpServer:
         self.sessions[sid] = session
         log.info("← connect sid=%s peer=%s", sid, peer)
 
-        # Immediately send SESSION
-        await self.send(session, f"SESSION {sid}")
+        # Immediately send SESSION (+ this broker's version so the client can
+        # show it; additive token, old clients ignore it).
+        await self.send(session, f"SESSION {sid} {SERVER_VERSION}")
 
         try:
             while True:
@@ -576,7 +690,12 @@ class FistbumpServer:
             log.info("disconnect sid=%s", sid)
 
     async def handle_cmd(self, session: ClientSession, cmd: str):
-        if cmd == "HELLO" or cmd.startswith("HELLO "):
+        if cmd == "VERSION" or cmd.startswith("VERSION "):
+            # Pre-auth in-game update check. Does NOT require login (the client
+            # checks its version before logging in) and does NOT close the
+            # connection. Replaces the removed Python-launcher GitHub check.
+            await self.handle_version(session)
+        elif cmd == "HELLO" or cmd.startswith("HELLO "):
             version = cmd[6:].strip() if " " in cmd else ""
             await self.handle_hello(session, version)
         elif cmd.startswith("REGISTER "):
@@ -615,6 +734,15 @@ class FistbumpServer:
             await self.handle_loading(session, cmd[8:])
         else:
             log.warning("unknown cmd sid=%s: %s", session.sid, cmd)
+
+    async def handle_version(self, session: ClientSession):
+        """VERSION [query] — pre-auth update check. Reply (one line):
+            VERSION latest <latest_ver> <url>
+        Answered LOCALLY from server-side constants on every node, including
+        edge nodes (self.upstream_url set) — the latest-version + releases URL
+        are static config, so an edge does NOT proxy this upstream (avoids
+        adding an internal endpoint). send() appends the newline."""
+        await self.send(session, f"VERSION latest {LATEST_CLIENT_VERSION} {UPDATE_RELEASES_URL}")
 
     async def handle_loading(self, session: ClientSession, payload: str):
         """LOADING <0|1> — client signals it is doing a blocking I/O burst
@@ -686,9 +814,12 @@ class FistbumpServer:
         if session.sid not in (m.sid_a, m.sid_b):
             return
         try:
+            # Clamp at ingest — this is display-only dashboard state, but a peer
+            # (or a forged STATE line) shouldn't be able to push absurd values.
             m.live_state = {
-                "hp1": int(hp1), "hp2": int(hp2), "round": int(rnd),
-                "char1": int(char1), "char2": int(char2),
+                "hp1": max(0, min(255, int(hp1))), "hp2": max(0, min(255, int(hp2))),
+                "round": max(0, min(20, int(rnd))),
+                "char1": max(0, min(63, int(char1))), "char2": max(0, min(63, int(char2))),
                 "reporter": session.username,
             }
             m.live_state_at = time.time()
@@ -991,14 +1122,17 @@ class FistbumpServer:
         pm.platform_b = b.platform  # type: ignore[attr-defined]
         self.matches[match_id] = pm
         room.current_match_id = match_id
-        try:
+        def _do(match_id=match_id, a_user=a.username, b_user=b.username,
+                a_plat=a.platform, b_plat=b.platform):
             self.db.execute(
                 "INSERT INTO matches (id, p1, p2, created_at, region, platform_a, platform_b)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (match_id, a.username, b.username, int(time.time()),
-                 self.region_code, a.platform or None, b.platform or None),
+                (match_id, a_user, b_user, int(time.time()),
+                 self.region_code, a_plat or None, b_plat or None),
             )
             self.db.commit()
+        try:
+            await self._db_write(_do)
         except Exception as e:
             log.warning("match persist failed: %s", e)
         a.match_id = match_id
@@ -1064,12 +1198,14 @@ class FistbumpServer:
                 "RESULT mismatch match=%s: A=%s/%s B=%s/%s (cheat attempt?)",
                 match_id, a_wins_a, b_wins_a, a_wins_b, b_wins_b,
             )
-            try:
+            def _do(match_id=match_id):
                 self.db.execute(
                     "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
                     ("DISPUTED", int(time.time()), match_id),
                 )
                 self.db.commit()
+            try:
+                await self._db_write(_do)
             except Exception:
                 pass
             m.finalized = True
@@ -1078,6 +1214,12 @@ class FistbumpServer:
             return
 
         a_wins, b_wins = a_wins_a, b_wins_a
+        # Bound cumulative credited games per match_id (belt-and-suspenders on
+        # top of the per-report 0..9 clamp) so a re-finalization loop can't
+        # inflate stats.
+        if (a_wins + b_wins) > MAX_COUNTED_GAMES:
+            log.warning("RESULT cumulative over cap match=%s: %d/%d", match_id, a_wins, b_wins)
+            return
         # Per-game crediting for in-game rematches: only the delta vs the
         # already-counted totals decides this game's winner.
         prev_counted = getattr(m, "counted", None) or (0, 0)
@@ -1102,43 +1244,11 @@ class FistbumpServer:
             m.finalized_at = time.time()
             await self._after_match_finalize(m)
             return
-        if game_winner is None:
-            # No new game to credit (tied first report, or stale duplicate).
+        # Single money path (TIE when game_winner is None — delta_a == delta_b).
+        outcome = await self._finalize_outcome(
+            match_id, m.user_a, m.user_b, delta_a, delta_b, m.is_ranked)
+        if outcome == "TIE":
             log.info("match %s ended as TIE", match_id)
-            try:
-                self.db.execute(
-                    "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
-                    ("TIE", int(time.time()), match_id),
-                )
-                self.db.commit()
-            except Exception:
-                pass
-            m.finalized = True
-            m.finalized_at = time.time()
-            await self._after_match_finalize(m)
-            return
-
-        winner = game_winner
-        loser = m.user_b if winner == m.user_a else m.user_a
-        if m.is_ranked:
-            await self._apply_elo(match_id, winner, loser)
-        else:
-            # Casual: bump wins/losses (visible on leaderboard) but skip ELO.
-            try:
-                self.db.execute(
-                    "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
-                    (winner, int(time.time()), match_id),
-                )
-                self.db.execute(
-                    "UPDATE users SET wins=wins+1 WHERE username=?", (winner,),
-                )
-                self.db.execute(
-                    "UPDATE users SET losses=losses+1 WHERE username=?", (loser,),
-                )
-                self.db.commit()
-            except Exception:
-                pass
-            log.info("casual match %s done — %s beat %s (no ELO change)", match_id, winner, loser)
         m.finalized = True
         m.finalized_at = time.time()
         await self._after_match_finalize(m)
@@ -1183,7 +1293,13 @@ class FistbumpServer:
         new_rb = rb + K * (0.0 - eb)
         delta_w = int(round(new_ra - ra))
         delta_l = int(round(new_rb - rb))
-        try:
+        # Resolve which match column gets which delta on the loop (reads the
+        # shared self.matches dict) so the worker thread does pure DB work.
+        p1_delta = delta_w if winner == self.matches[match_id].user_a else delta_l
+        p2_delta = delta_w if winner == self.matches[match_id].user_b else delta_l
+        def _do(match_id=match_id, winner=winner, loser=loser,
+                delta_w=delta_w, delta_l=delta_l,
+                p1_delta=p1_delta, p2_delta=p2_delta):
             self.db.execute(
                 "UPDATE users SET elo=elo+?, wins=wins+1 WHERE username=?",
                 (delta_w, winner),
@@ -1194,15 +1310,11 @@ class FistbumpServer:
             )
             self.db.execute(
                 "UPDATE matches SET winner=?, p1_elo_delta=?, p2_elo_delta=?, completed_at=? WHERE id=?",
-                (
-                    winner,
-                    delta_w if winner == self.matches[match_id].user_a else delta_l,
-                    delta_w if winner == self.matches[match_id].user_b else delta_l,
-                    int(time.time()),
-                    match_id,
-                ),
+                (winner, p1_delta, p2_delta, int(time.time()), match_id),
             )
             self.db.commit()
+        try:
+            await self._db_write(_do)
         except Exception as e:
             log.warning("elo update failed: %s", e)
             return
@@ -1210,6 +1322,46 @@ class FistbumpServer:
             "ELO match=%s %s +%d (→%d) vs %s %d (→%d)",
             match_id, winner, delta_w, ra + delta_w, loser, delta_l, rb + delta_l,
         )
+
+    async def _finalize_outcome(self, match_id: str, user_a: str, user_b: str,
+                                delta_a: int, delta_b: int, is_ranked: bool) -> str:
+        """The single money path. Given the per-side win deltas for the game
+        that just completed, write the outcome and return the winner username
+        ('TIE' when drawn). Ranked → ELO; casual → wins/losses bump. The TCP
+        RESULT path and the internal (edge→leader) result path both delegate
+        here so the two finalize implementations can't drift."""
+        if delta_a == delta_b:
+            def _do(match_id=match_id):
+                self.db.execute(
+                    "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
+                    ("TIE", int(time.time()), match_id),
+                )
+                self.db.commit()
+            try:
+                await self._db_write(_do)
+            except Exception:
+                pass
+            return "TIE"
+        winner = user_a if delta_a > delta_b else user_b
+        loser = user_b if winner == user_a else user_a
+        if is_ranked:
+            await self._apply_elo(match_id, winner, loser)
+        else:
+            # Casual: bump wins/losses (visible on leaderboard) but skip ELO.
+            def _do(match_id=match_id, winner=winner, loser=loser):
+                self.db.execute(
+                    "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
+                    (winner, int(time.time()), match_id),
+                )
+                self.db.execute("UPDATE users SET wins=wins+1 WHERE username=?", (winner,))
+                self.db.execute("UPDATE users SET losses=losses+1 WHERE username=?", (loser,))
+                self.db.commit()
+            try:
+                await self._db_write(_do)
+            except Exception:
+                pass
+            log.info("casual match %s done — %s beat %s (no ELO change)", match_id, winner, loser)
+        return winner
 
     async def _handle_internal_auth(self, body: dict) -> dict:
         """Upstream endpoint: register/login/refresh. Validates against local DB,
@@ -1228,7 +1380,7 @@ class FistbumpServer:
             if self.db_get_user(username):
                 return {"ok": False, "reject": "REJECT username taken"}
             try:
-                self.db_create_user(username, password)
+                await self._create_user_async(username, password)
             except Exception as e:
                 log.warning("internal register fail user=%s: %s", username, e)
                 return {"ok": False, "reject": "REJECT register failed"}
@@ -1237,7 +1389,7 @@ class FistbumpServer:
             username = (body.get("username") or "").strip()
             password = body.get("password") or ""
             row = self.db_get_user(username)
-            if not row or not verify_password(password, row[1]):
+            if not row or not await self._verify_password_async(password, row[1]):
                 return {"ok": False, "reject": "REJECT invalid username or password"}
             self.db_touch_login(username)
             log.info("LOGIN (internal) user=%s ip=%s elo=%d", username, body.get("ip"), row[2])
@@ -1272,6 +1424,13 @@ class FistbumpServer:
         is_ranked = bool(body.get("is_ranked"))
         if not match_id or not user_a or not user_b:
             return {"ok": False, "reject": "missing fields"}
+        # Mirror the TCP path's per-report clamp + cumulative cap:
+        # the internal path previously trusted unbounded a_wins/b_wins, so a
+        # bearer holder could fabricate huge ELO swings.
+        if not (0 <= a_wins <= 9 and 0 <= b_wins <= 9):
+            return {"ok": False, "reject": "wins out of bounds"}
+        if (a_wins + b_wins) > MAX_COUNTED_GAMES:
+            return {"ok": False, "reject": "cumulative over cap"}
         # Ensure matches row exists (edge server's match_id may not have been
         # inserted here). Insert lazily so completion writes succeed.
         try:
@@ -1302,42 +1461,13 @@ class FistbumpServer:
             if (a_wins + b_wins) <= (prev_counted[0] + prev_counted[1]):
                 return {"ok": True, "winner": "DUPLICATE"}
             m_stub.counted = (a_wins, b_wins)  # type: ignore[attr-defined]
-        if delta_a == delta_b:
-            try:
-                self.db.execute(
-                    "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
-                    ("TIE", int(time.time()), match_id),
-                )
-                self.db.commit()
-            except Exception:
-                pass
+        # Same money path as the TCP RESULT handler.
+        winner = await self._finalize_outcome(
+            match_id, user_a, user_b, delta_a, delta_b, is_ranked)
+        if winner == "TIE":
             log.info("(internal) match %s TIE", match_id)
-            if m_stub:
-                m_stub.finalized = True
-                m_stub.finalized_at = time.time()
-            return {"ok": True, "winner": "TIE"}
-        winner = user_a if delta_a > delta_b else user_b
-        loser = user_b if winner == user_a else user_a
-        if is_ranked:
-            await self._apply_elo(match_id, winner, loser)
         else:
-            # For casual matches also bump wins/losses so leaderboard reflects
-            # activity even when no ELO change.
-            try:
-                self.db.execute(
-                    "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
-                    (winner, int(time.time()), match_id),
-                )
-                self.db.execute(
-                    "UPDATE users SET wins=wins+1 WHERE username=?", (winner,),
-                )
-                self.db.execute(
-                    "UPDATE users SET losses=losses+1 WHERE username=?", (loser,),
-                )
-                self.db.commit()
-            except Exception:
-                pass
-            log.info("(internal) casual match %s done — %s beat %s", match_id, winner, loser)
+            log.info("(internal) match %s done — winner %s", match_id, winner)
         if m_stub:
             m_stub.finalized = True
             m_stub.finalized_at = time.time()
@@ -1352,11 +1482,14 @@ class FistbumpServer:
         import urllib.error
         url = self.upstream_url + path
         data = _json.dumps(body).encode("utf-8")
+        ts = str(int(time.time()))
         req = urllib.request.Request(
             url, data=data, method="POST",
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {INTERNAL_SECRET}",
+                "X-Fistbump-Timestamp": ts,
+                "X-Fistbump-Sig": internal_sign(path, ts, data),
             },
         )
         def _do():
@@ -1404,28 +1537,41 @@ class FistbumpServer:
         await self._rebind_user_rooms(session)
         return True
 
-    async def handle_register(self, session: ClientSession, payload: str):
-        """REGISTER <username> <password> <version>"""
+    async def _parse_auth_payload(self, session: ClientSession, payload: str, action: str):
+        """Shared REGISTER/LOGIN prologue: rate-limit, parse
+        '<user> <pass> <version> [platform]', version-gate, and proxy to upstream
+        when this is an edge node. Returns (username, password, version) to
+        continue with a local DB op, or None when the request was already
+        rejected/proxied (caller returns immediately)."""
         ip = session.peername[0] if session.peername else "?"
         if not self._rate_check(ip, "hello", HELLO_RATE_LIMIT):
-            self._register_reject(ip, "register rate")
-            await self.send(session, "REJECT rate-limited (register)")
-            return
+            self._register_reject(ip, f"{action} rate")
+            await self.send(session, f"REJECT rate-limited ({action})")
+            return None
         parts = payload.split(" ", 2)
         if len(parts) < 3:
-            await self.send(session, "REJECT register requires: <username> <password> <version>")
-            return
+            await self.send(session, f"REJECT {action} requires: <username> <password> <version>")
+            return None
         username, password = parts[0], parts[1]
         version, _plat = _split_version_platform(parts[2])
         if _plat:
             session.platform = _plat
         if not self._check_version(session, version):
             await self.send(session, f"REJECT version mismatch — allowed: {','.join(sorted(ALLOWED_VERSIONS))}")
-            return
+            return None
         if self.upstream_url:
-            await self._proxy_auth(session, "register",
+            await self._proxy_auth(session, action,
                                    {"username": username, "password": password, "version": version})
+            return None
+        return username, password, version
+
+    async def handle_register(self, session: ClientSession, payload: str):
+        """REGISTER <username> <password> <version>"""
+        parsed = await self._parse_auth_payload(session, payload, "register")
+        if parsed is None:
             return
+        username, password, _version = parsed
+        ip = session.peername[0] if session.peername else "?"
         if not is_valid_username(username):
             await self.send(session, "REJECT invalid username (3-16 chars, a-zA-Z0-9_)")
             return
@@ -1436,7 +1582,7 @@ class FistbumpServer:
             await self.send(session, "REJECT username taken")
             return
         try:
-            self.db_create_user(username, password)
+            await self._create_user_async(username, password)
             log.info("REGISTER sid=%s ip=%s user=%s", session.sid, ip, username)
         except Exception as e:
             log.warning("register fail user=%s: %s", username, e)
@@ -1446,28 +1592,13 @@ class FistbumpServer:
 
     async def handle_login(self, session: ClientSession, payload: str):
         """LOGIN <username> <password> <version>"""
+        parsed = await self._parse_auth_payload(session, payload, "login")
+        if parsed is None:
+            return
+        username, password, _version = parsed
         ip = session.peername[0] if session.peername else "?"
-        if not self._rate_check(ip, "hello", HELLO_RATE_LIMIT):
-            self._register_reject(ip, "login rate")
-            await self.send(session, "REJECT rate-limited (login)")
-            return
-        parts = payload.split(" ", 2)
-        if len(parts) < 3:
-            await self.send(session, "REJECT login requires: <username> <password> <version>")
-            return
-        username, password = parts[0], parts[1]
-        version, _plat = _split_version_platform(parts[2])
-        if _plat:
-            session.platform = _plat
-        if not self._check_version(session, version):
-            await self.send(session, f"REJECT version mismatch — allowed: {','.join(sorted(ALLOWED_VERSIONS))}")
-            return
-        if self.upstream_url:
-            await self._proxy_auth(session, "login",
-                                   {"username": username, "password": password, "version": version})
-            return
         row = self.db_get_user(username)
-        if not row or not verify_password(password, row[1]):
+        if not row or not await self._verify_password_async(password, row[1]):
             self._register_reject(ip, "bad login")
             await self.send(session, "REJECT invalid username or password")
             return
@@ -1572,6 +1703,7 @@ class FistbumpServer:
     async def complete_login_anon(self, session: ClientSession, username: str):
         session.username = username
         session.state = "logged_in"
+        session.is_anon = True
         # Short-lived dummy token (won't survive REFRESH check)
         expiry = int(time.time()) + 24 * 3600
         await self.send(session, f"TOKEN refresh anon.{expiry}.x {expiry}")
@@ -1617,9 +1749,8 @@ class FistbumpServer:
         if session.state != "logged_in":
             log.warning("queue add from non-logged-in sid=%s state=%s", session.sid, session.state)
             return
-        # Anonymous users can only play casual
-        is_anon = session.username.startswith("anon")
-        if mode == "ranked" and is_anon:
+        # Anonymous users can only play casual (explicit flag, not a name guess)
+        if mode == "ranked" and session.is_anon:
             await self.send(session, "REJECT ranked requires registered account")
             return
         # Remove from other queue if present
@@ -1668,14 +1799,17 @@ class FistbumpServer:
                 pm.platform_a = a.platform  # type: ignore[attr-defined]
                 pm.platform_b = b.platform  # type: ignore[attr-defined]
                 self.matches[match_id] = pm
-                try:
+                def _do(match_id=match_id, a_user=a.username, b_user=b.username,
+                        a_plat=a.platform, b_plat=b.platform):
                     self.db.execute(
                         "INSERT INTO matches (id, p1, p2, created_at, region, platform_a, platform_b)"
                         " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (match_id, a.username, b.username, int(time.time()),
-                         self.region_code, a.platform or None, b.platform or None),
+                        (match_id, a_user, b_user, int(time.time()),
+                         self.region_code, a_plat or None, b_plat or None),
                     )
                     self.db.commit()
+                try:
+                    await self._db_write(_do)
                 except Exception as e:
                     log.warning("match persist failed: %s", e)
                 a.match_id = match_id
@@ -1785,12 +1919,27 @@ class FistbumpServer:
                 # Wire: START <player> <relay_endpoint> <uuid> <use_relay> <peer_direct>
                 await self.send(a, f"START 1 {relay_endpoint} {match_id} {use_relay} {a_direct}")
                 await self.send(b, f"START 2 {relay_endpoint} {match_id} {use_relay} {b_direct}")
-                self.relay_routes[match_id] = {"1": None, "2": None}
+                # Snapshot the authenticated punch IPs (side "1"=a, "2"=b) so the
+                # relay path can reject datagrams whose source IP doesn't match
+                # the peer learned during the validated UDP punch — independent
+                # of later session mutations. Both endpoints are guaranteed set
+                # by the guard above.
+                self.relay_routes[match_id] = {
+                    "1": None, "2": None,
+                    "ip1": a.udp_endpoint[0] if a.udp_endpoint else None,
+                    "ip2": b.udp_endpoint[0] if b.udp_endpoint else None,
+                }
                 m.started = True
                 log.info("START dispatched for match %s (use_relay=%d, same_ip=%s, lan_direct=%s)",
                          match_id, use_relay, same_external_ip, lan_direct)
 
-    async def handle_relay(self, data: bytes, addr: tuple) -> None:
+    def handle_relay(self, data: bytes, addr: tuple) -> None:
+        # NOTE: intentionally a PLAIN (non-async) method — its entire body does
+        # zero awaits, so RelayProto.datagram_received calls it INLINE rather
+        # than via asyncio.create_task. Scheduling a Task per packet added an
+        # event-loop turn and could reorder relay forwarding for no concurrency
+        # benefit. Keep this sync; if you ever add an await here you
+        # must restore the create_task wrapper in datagram_received.
         # Wire format: 36 chars uuid + 1 char side + payload.
         if len(data) < 37:
             return
@@ -1801,12 +1950,62 @@ class FistbumpServer:
         route = self.relay_routes.get(uuid)
         if route is None:
             return  # no such match
-        # Lazy registration: record sender's relay endpoint on first packet.
-        route[side] = addr
+
+        now = time.time()
+
+        # Per-side rate limit (defense-in-depth vs flood / amplification). State
+        # lives inside the route dict so it is reaped with the match.
+        rl = route.get("_rl")
+        if rl is None:
+            rl = {"1": [0, now], "2": [0, now]}
+            route["_rl"] = rl
+        bucket = rl[side]
+        if now - bucket[1] >= 1.0:
+            bucket[0] = 0
+            bucket[1] = now
+        bucket[0] += 1
+        if bucket[0] > RELAY_RATE_MAX_PER_SEC:
+            return  # over rate — drop
+
+        # Authenticate the binding. The trustworthy endpoint is the one learned
+        # during the AUTHENTICATED UDP punch (handle_udp validated sid+match_id).
+        # The relay socket is a *different* port than the punch socket, so under
+        # symmetric NAT the source PORT may legitimately differ — match on IP
+        # only and learn the port from the first relay packet, then LOCK the
+        # binding. The old code rebound route[side] on EVERY packet, letting any
+        # spoofed datagram hijack/blackhole a side (the reported vuln) and turn
+        # the relay into a reflective amplifier toward an attacker-named victim.
+        expected_ip = route.get("ip" + side)  # snapshotted at START dispatch
+        bound = route.get(side)
+        if bound is None:
+            # First packet for this side: learn-on-first-use. The punch-IP
+            # snapshot is ADVISORY, not a hard gate — a legitimate peer on a
+            # multi-WAN / per-flow-load-balancing NAT can egress the relay port
+            # (:19002) from a different public IP than the punch port (:19001),
+            # so a hard reject here kills the relay for those users entirely. The
+            # real protection is the lock-after-bind below: once bound, only a
+            # same-IP port drift is accepted — that defeats the per-packet-rebind
+            # hijack the lock exists to close. Log a mismatch for visibility.
+            if expected_ip is not None and addr[0] != expected_ip:
+                log.info("relay bind uuid=%s side=%s from %s (differs from punch ip %s — learn-on-first-use)",
+                         uuid, side, addr, expected_ip)
+            elif expected_ip is None:
+                log.info("relay bind uuid=%s side=%s from %s (punch ip unknown — first-seen)",
+                         uuid, side, addr)
+            route[side] = addr
+        elif addr != bound:
+            # Already bound: tolerate a same-IP port re-map (NAT keepalive);
+            # reject a different source IP (hijack attempt).
+            if addr[0] != bound[0]:
+                log.warning("relay source reject uuid=%s side=%s %s -> %s",
+                            uuid, side, bound, addr)
+                return
+            route[side] = addr  # same IP, port drifted — accept
+
         # Refresh finalized_at on activity so REMATCH keeps the relay alive.
         m = self.matches.get(uuid)
         if m is not None and m.finalized:
-            m.finalized_at = time.time()
+            m.finalized_at = now
         # Forward to the other side, if known.
         other_side = "2" if side == "1" else "1"
         dst = route.get(other_side)
@@ -1958,15 +2157,22 @@ class FistbumpServer:
 
     # ---------- Stats HTTP ----------
 
-    def _build_stats_dict(self):
-        import json as _json
+    def _build_leaderboard_blocking(self) -> dict:
+        """DB-heavy half of the stats dict: users count + top-50 leaderboard +
+        per-player platform/region badges. Runs in a worker thread (off the
+        event loop) using its OWN read-only connection, so it never blocks
+        matchmaking and never shares self.db across threads. The platform/region
+        scan is scoped to the 50 displayed usernames instead of every completed
+        match."""
+        db = sqlite3.connect(DB_PATH)
         try:
-            cur = self.db.execute("SELECT COUNT(*) FROM users")
-            total_users = cur.fetchone()[0]
-            # Sort: ranked players first by ELO desc, then unranked (less than PLACEMENT) by wins
-            cur = self.db.execute(
+            total_users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            # Sort: ranked players first by ELO desc; unranked (< PLACEMENT) have
+            # near-default ELO so the wins tiebreak orders them by wins, matching
+            # the displayed "by wins" intent.
+            cur = db.execute(
                 "SELECT username, elo, wins, losses, last_login_at FROM users "
-                "ORDER BY (wins + losses >= ?) DESC, elo DESC LIMIT 50",
+                "ORDER BY (wins + losses >= ?) DESC, elo DESC, wins DESC LIMIT 50",
                 (PLACEMENT_MATCHES,),
             )
             leaderboard = []
@@ -1984,28 +2190,48 @@ class FistbumpServer:
                     "sub": rank["sub"],
                 })
             # Platforms + regions per player, from completed matches (1.7.28).
+            # Scoped to the displayed names (badges only show for these) so the
+            # scan is bounded by the IN list + idx_matches_completed, not the
+            # whole matches table.
             _PLAT_LABEL = {"windows": "PC", "macos": "PC", "linux": "PC",
                            "android": "Android", "vita": "Vita"}
             plat_map: dict = {}
             reg_map: dict = {}
-            cur = self.db.execute(
-                "SELECT p1, platform_a, p2, platform_b, region FROM matches"
-                " WHERE completed_at IS NOT NULL")
-            for _p1, _pa, _p2, _pb, _reg in cur.fetchall():
-                if _pa:
-                    plat_map.setdefault(_p1, set()).add(_PLAT_LABEL.get(_pa, _pa))
-                if _pb:
-                    plat_map.setdefault(_p2, set()).add(_PLAT_LABEL.get(_pb, _pb))
-                if _reg and _reg != "unknown":
-                    reg_map.setdefault(_p1, set()).add(_reg)
-                    reg_map.setdefault(_p2, set()).add(_reg)
+            names = [e["username"] for e in leaderboard]
+            if names:
+                ph = ",".join("?" * len(names))
+                cur = db.execute(
+                    "SELECT p1, platform_a, p2, platform_b, region FROM matches"
+                    " WHERE completed_at IS NOT NULL"
+                    f" AND (p1 IN ({ph}) OR p2 IN ({ph}))",
+                    names + names,
+                )
+                for _p1, _pa, _p2, _pb, _reg in cur.fetchall():
+                    if _pa:
+                        plat_map.setdefault(_p1, set()).add(_PLAT_LABEL.get(_pa, _pa))
+                    if _pb:
+                        plat_map.setdefault(_p2, set()).add(_PLAT_LABEL.get(_pb, _pb))
+                    if _reg and _reg != "unknown":
+                        reg_map.setdefault(_p1, set()).add(_reg)
+                        reg_map.setdefault(_p2, set()).add(_reg)
             for entry in leaderboard:
                 entry["platforms"] = sorted(plat_map.get(entry["username"], ()))
                 entry["regions"] = sorted(reg_map.get(entry["username"], ()))
+            return {"users_total": total_users, "leaderboard": leaderboard}
         except Exception as e:
             log.warning("leaderboard query failed: %s", e)
-            total_users = 0
-            leaderboard = []
+            return {"users_total": 0, "leaderboard": []}
+        finally:
+            db.close()
+
+    async def _get_stats(self) -> dict:
+        """Assemble the stats dict: cached DB half (rebuilt off-loop at most once
+        per STATS_CACHE_TTL_S) + live in-memory counts (cheap, loop thread)."""
+        now = time.time()
+        if self._stats_cache is None or (now - self._stats_cache_at) >= STATS_CACHE_TTL_S:
+            self._stats_cache = await asyncio.to_thread(self._build_leaderboard_blocking)
+            self._stats_cache_at = now
+        db_part = self._stats_cache
         return {
             "connected": len(self.sessions),
             "queue": len(self.queue_casual) + len(self.queue_ranked),
@@ -2013,8 +2239,8 @@ class FistbumpServer:
             "queue_ranked": len(self.queue_ranked),
             "matches_pending": len(self.matches),
             "users_connected": [s.username for s in self.sessions.values() if s.username],
-            "users_total": total_users,
-            "leaderboard": leaderboard,
+            "users_total": db_part["users_total"],
+            "leaderboard": db_part["leaderboard"],
             "versions": list({s.version for s in self.sessions.values() if s.version}),
             "bans_count": len(self.bans),
             "allowed_versions": sorted(ALLOWED_VERSIONS),
@@ -2102,10 +2328,10 @@ class FistbumpServer:
       <span data-i18n-es>Descarga la última build (Windows 10/11 x64) — ver release en GitHub.</span></li>
   <li><span data-i18n-en>You need your own legally-dumped Street Fighter III: 3rd Strike PS2 ISO (NTSC-J). The game asks for it on first launch.</span>
       <span data-i18n-es>Necesitas tu propia ISO de Street Fighter III: 3rd Strike PS2 (NTSC-J) dumpeada legalmente. El juego la pide al primer arranque.</span></li>
-  <li><span data-i18n-en>Run <code>3sx_launcher_online.exe</code> — register a username and password.</span>
-      <span data-i18n-es>Ejecuta <code>3sx_launcher_online.exe</code> — registra un usuario y contraseña.</span></li>
-  <li><span data-i18n-en>Click LAUNCH GAME — matchmaking finds you an opponent. Or create a private room and share the code with a friend.</span>
-      <span data-i18n-es>Click LAUNCH GAME — el matchmaking te encuentra rival. O crea una sala privada y comparte el código con un amigo.</span></li>
+  <li><span data-i18n-en>Run <code>3sx.exe</code> and register a username and password in the in-game online menu.</span>
+      <span data-i18n-es>Ejecuta <code>3sx.exe</code> y registra un usuario y contraseña en el menú online del juego.</span></li>
+  <li><span data-i18n-en>Pick a region and search for a match from the in-game online menu — or create a private room and share the code with a friend.</span>
+      <span data-i18n-es>Elige una región y busca partida desde el menú online del juego — o crea una sala privada y comparte el código con un amigo.</span></li>
   <li><span data-i18n-en>Win 5 placement matches to reveal your rank. Climb the leaderboard.</span>
       <span data-i18n-es>Gana 5 partidas de clasificación para revelar tu rango. Sube en la tabla.</span></li>
 </ol>
@@ -2132,8 +2358,8 @@ class FistbumpServer:
   </div>
   <div class="card"><span class="icon"></span>
     <h3><span data-i18n-en>Global Chat</span><span data-i18n-es>Chat Global</span></h3>
-    <p><span data-i18n-en>Talk to other players in the launcher before and after matches.</span>
-       <span data-i18n-es>Habla con otros jugadores en el launcher antes y después de las peleas.</span></p>
+    <p><span data-i18n-en>Talk to other players in-game before and after matches.</span>
+       <span data-i18n-es>Habla con otros jugadores en el juego antes y después de las peleas.</span></p>
   </div>
   <div class="card"><span class="icon"></span>
     <h3><span data-i18n-en>Anti-Cheat</span><span data-i18n-es>Anti-Trampa</span></h3>
@@ -2383,6 +2609,8 @@ class FistbumpServer:
             request_content_length = 0
             request_method = "GET"
             request_authorization = ""
+            request_hmac_ts = ""
+            request_hmac_sig = ""
             try:
                 request_method = req.split(" ", 1)[0].upper()
             except Exception:
@@ -2401,6 +2629,10 @@ class FistbumpServer:
                         pass
                 elif decoded.lower().startswith("authorization:"):
                     request_authorization = decoded.split(":", 1)[1].strip()
+                elif decoded.lower().startswith("x-fistbump-timestamp:"):
+                    request_hmac_ts = decoded.split(":", 1)[1].strip()
+                elif decoded.lower().startswith("x-fistbump-sig:"):
+                    request_hmac_sig = decoded.split(":", 1)[1].strip()
             # Route
             path = "/"
             try:
@@ -2441,6 +2673,29 @@ class FistbumpServer:
                 body_bytes = b""
                 if request_content_length > 0:
                     body_bytes = await asyncio.wait_for(reader.read(request_content_length), timeout=5.0)
+                # Replay/forge protection: verify the per-request HMAC
+                # over (path, timestamp, body). Tolerant — enforced only when a
+                # signature header is present, unless FISTBUMP_REQUIRE_HMAC is set.
+                if request_hmac_sig or REQUIRE_INTERNAL_HMAC:
+                    sig_ok = False
+                    try:
+                        if abs(int(time.time()) - int(request_hmac_ts)) <= INTERNAL_HMAC_WINDOW_S:
+                            sig_ok = hmac.compare_digest(
+                                request_hmac_sig, internal_sign(path, request_hmac_ts, body_bytes))
+                    except Exception:
+                        sig_ok = False
+                    if not sig_ok:
+                        _body = b'{"ok":false,"reject":"bad signature"}'
+                        _rh = (
+                            "HTTP/1.1 403 Forbidden\r\n"
+                            "Content-Type: application/json\r\n"
+                            f"Content-Length: {len(_body)}\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                        ).encode("utf-8")
+                        writer.write(_rh + _body)
+                        await writer.drain()
+                        return
                 try:
                     req_body = _json.loads(body_bytes.decode("utf-8") or "{}")
                 except Exception:
@@ -2508,6 +2763,31 @@ class FistbumpServer:
                 logs_dir = "/opt/fistbump/logs"
                 os.makedirs(logs_dir, exist_ok=True)
                 log_file = os.path.join(logs_dir, f"{log_username}.log")
+                # This route is unauthenticated (shipped clients upload without a
+                # token), so bound the total log-dir footprint to stop cycling
+                # 32-char usernames from filling the disk. Overwriting
+                # an existing file is always allowed (no net growth); a NEW file
+                # is refused once the dir is over budget.
+                if not os.path.exists(log_file):
+                    try:
+                        used = sum(
+                            os.path.getsize(os.path.join(logs_dir, f))
+                            for f in os.listdir(logs_dir)
+                            if os.path.isfile(os.path.join(logs_dir, f))
+                        )
+                    except OSError:
+                        used = 0
+                    if used + len(log_data) > LOG_DIR_MAX_BYTES:
+                        _body = b"Insufficient Storage"
+                        _rh = (
+                            "HTTP/1.1 507 Insufficient Storage\r\n"
+                            f"Content-Length: {len(_body)}\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                        ).encode("utf-8")
+                        writer.write(_rh + _body)
+                        await writer.drain()
+                        return
                 with open(log_file, "wb") as _lf:
                     _lf.write(log_data)
                 _resp = _json.dumps({"ok": True, "bytes": len(log_data)}).encode("utf-8")
@@ -2522,17 +2802,17 @@ class FistbumpServer:
                 await writer.drain()
                 return
 
-            # Auto-updater routes removed: the launcher updates only from GitHub
-            # Releases. The matchmaking host never serves game binaries or update
-            # manifests (security hardening) — see launcher.py _check_update.
+            # The matchmaking host never serves game binaries or update
+            # manifests (security hardening). Clients discover new releases via
+            # the VERSION command + the in-game update check.
 
             status = 200
             if path.startswith("/api"):
-                stats = self._build_stats_dict()
+                stats = await self._get_stats()
                 body = _json.dumps(stats).encode("utf-8")
                 content_type = "application/json"
             elif path.startswith("/metrics"):
-                stats = self._build_stats_dict()
+                stats = await self._get_stats()
                 # Prometheus exposition format (text/plain)
                 try:
                     completed = self.db.execute(
@@ -2594,7 +2874,7 @@ class FistbumpServer:
                 body = html.encode("utf-8")
                 content_type = "text/html; charset=utf-8"
             else:
-                stats = self._build_stats_dict()
+                stats = await self._get_stats()
                 body = self._render_leaderboard_html(stats).encode("utf-8")
                 content_type = "text/html; charset=utf-8"
 
@@ -2650,7 +2930,8 @@ class FistbumpServer:
                 self.srv.relay_transport = transport
                 log.info("RELAY listening on :%d", self.srv.relay_port)
             def datagram_received(self, data, addr):
-                asyncio.create_task(self.srv.handle_relay(data, addr))
+                # handle_relay is sync (no awaits) — forward inline, no Task.
+                self.srv.handle_relay(data, addr)
 
         await loop.create_datagram_endpoint(
             lambda: RelayProto(self),
@@ -2681,8 +2962,8 @@ class FistbumpServer:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--tcp-port", type=int, default=9000)
-    p.add_argument("--udp-port", type=int, default=9001)
+    p.add_argument("--tcp-port", type=int, default=19000)
+    p.add_argument("--udp-port", type=int, default=19001)
     p.add_argument("--relay-port", type=int, default=19002)
     p.add_argument("--public-host", default="127.0.0.1",
                    help="Public IP advertised to clients in START")

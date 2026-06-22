@@ -8,7 +8,7 @@ Single-process Python 3.11+ asyncio server. SQLite for accounts + match history.
 
 | Surface | Purpose |
 |---|---|
-| TCP 19000 | Line-protocol signaling: `HELLO / REGISTER / LOGIN / REFRESH / SET / QUEUE / ROOM / CHAT / RESULT / STATE / DECLINE`. Server-pushed: `SESSION / TOKEN / PROFILE / MATCH / START / REJECT / CANCEL / LOADING`. |
+| TCP 19000 | Line-protocol signaling: `VERSION / HELLO / REGISTER / LOGIN / REFRESH / SET / QUEUE / ROOM / CHAT / RESULT / STATE / DECLINE` (`VERSION` is a pre-auth update check). Server-pushed: `SESSION / TOKEN / PROFILE / MATCH / START / REJECT / CANCEL / LOADING`. |
 | UDP 19001 | NAT-punch + endpoint discovery. Server captures the public `(ip, port)` of each peer's punch packet, dispatches them at `START` time. |
 | UDP 19002 | Relay fallback for CGNAT / symmetric-NAT peers. 36-char match-id prefix + 1-char side selector routes packets. |
 | HTTP 20000 (loopback) | Stats JSON + live-match viewer + leaderboard. Expected behind nginx + TLS (sample at `nginx/fistbump.example.com.conf.example`). |
@@ -20,14 +20,14 @@ Multi-region: edge nodes can forward `REGISTER / LOGIN / REFRESH / RESULT` to a 
 ## Quick start
 
 ```sh
-python3 server.py --tcp-port 9000 --udp-port 9001 -v
+python3 server.py --tcp-port 19000 --udp-port 19001 -v
 ```
 
 On another machine (or the same one), point a client at it by dropping a `regions.txt` somewhere the client reads:
 
 ```
 # code|label|host|port
-local|Local|127.0.0.1|9000
+local|Local|127.0.0.1|19000
 ```
 
 See [`SalieriMZ/3sx-online`](https://github.com/SalieriMZ/3sx-online) for client-side configuration.
@@ -37,14 +37,14 @@ See [`SalieriMZ/3sx-online`](https://github.com/SalieriMZ/3sx-online) for client
 Spin up two anonymous sessions (server has to be started with `FISTBUMP_ALLOW_ANON=1`):
 
 ```sh
-FISTBUMP_ALLOW_ANON=1 python3 server.py --tcp-port 9000 --udp-port 9001 -v
+FISTBUMP_ALLOW_ANON=1 python3 server.py --tcp-port 19000 --udp-port 19001 -v
 ```
 
 then attach raw TCP clients:
 
 ```sh
-nc localhost 9000
-> HELLO 1.3.1
+nc localhost 19000
+> HELLO 1.4.0
 < SESSION <sid>
 > QUEUE casual
 ...
@@ -82,20 +82,18 @@ Copy `nginx/fistbump.example.com.conf.example` to your sites-enabled, replace th
 
 ## Publishing client updates
 
-The launcher updates **only from GitHub Releases** — it polls the public repo's
-`releases/latest`, compares the tag against the installed `VERSION`, and prompts
-the player to re-download the zip from github.com (HTTPS, public checksums). The
-matchmaking host never serves game binaries: cut a GitHub release (`stable-x.y.z`,
-marked *Latest*) and existing installs pick it up automatically.
+Updates are checked **in-game**, not by a launcher. On connect the client sends a
+pre-auth `VERSION` command on the TCP line; the server answers on one line with
+`VERSION latest <latest_ver> <url>` — `LATEST_CLIENT_VERSION` plus the public
+GitHub `releases/latest` URL. The game compares that to its baked build version
+and tells the player either that they're up to date or that an update is
+available (opening the GitHub releases page). The matchmaking host never serves
+game binaries or update manifests.
 
-Bump `launcher/launcher.py` `APP_VERSION` + `server.py` `ALLOWED_VERSIONS` in
-lockstep so the new launcher's login is accepted.
-
-> **Legacy self-hosted channel (deprecated, off by default).** `publish_update.sh`
-> SCPs a zip + `<channel>.json` manifest to a server for forks that prefer an
-> in-place updater. The shipped launcher ignores it; it only activates if a fork
-> sets `FISTBUMP_SERVER_BASE_URL` *and* re-adds a manifest update path. Not used
-> by the reference deployment — we keep updates on GitHub on purpose.
+To ship a release: cut a GitHub release (`stable-x.y.z`, marked *Latest*), then on
+the server bump `ALLOWED_VERSIONS` (and `SERVER_VERSION` / `LATEST_CLIENT_VERSION`)
+in `server.py`. Older clients fall out of `ALLOWED_VERSIONS`, get rejected, and
+the in-game update check points them at the new release.
 
 ## Repo layout
 
@@ -103,12 +101,8 @@ lockstep so the new launcher's login is accepted.
 server.py                  Single-file asyncio server (~2.7k LOC).
 fistbump.service           Systemd unit, reads /etc/default/fistbump.
 deploy.sh                  Generic SSH deploy of server.py + unit.
-publish_update.sh          SCP zip + manifest + chown on the remote.
-publish_update.env.example Required env vars for publish_update.sh.
-build_dist.sh              Build 3sx.exe + slim launcher + bootstrap → dist/.
 Dockerfile                 Alpine + python3 + server.py copy.
 nginx/                     Reverse-proxy template.
-launcher/                  Tk-based desktop launcher (Play + auto-update).
 ```
 
 ## Configuration
@@ -118,8 +112,8 @@ launcher/                  Tk-based desktop launcher (Play + auto-update).
 | `FISTBUMP_ALLOW_ANON` | `0` | Allow `HELLO` without credentials (dev/local only). |
 | `FISTBUMP_RATE_WHITELIST` | empty | Comma-separated IPs exempt from per-IP rate limits. |
 | `--public-host` / `$PUBLIC_HOST` | `127.0.0.1` | Public IP/hostname advertised to clients in `START`. |
-| `--tcp-port` | `9000` | Signaling port. |
-| `--udp-port` | `9001` | NAT-punch + match-data port (reused as the GekkoNet socket on the client side). |
+| `--tcp-port` | `19000` | Signaling port. |
+| `--udp-port` | `19001` | NAT-punch + match-data port (reused as the GekkoNet socket on the client side). |
 | `--relay-port` | `19002` | Relay UDP port for CGNAT peers. |
 | `--upstream-url` | unset | Edge mode: HTTPS base URL of the leader for auth + result forwarding. |
 
