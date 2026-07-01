@@ -18,13 +18,13 @@ Ports (defaults, all overridable):
 There are **two related version numbers**:
 
 - **Game protocol version** — the in-binary netcode/state protocol checked at
-  login via `ALLOWED_VERSIONS` (`server.py:309`, currently `{"1.4.0"}`). Two
+  login via `ALLOWED_VERSIONS` (`server.py:309`, currently `{"1.4.1"}`). Two
   clients can only cross-play if these match. Bumped only when the rollback state
-  layout or the input/match wire format changes. Release 1.8.0 cut the protocol to
-  `1.4.0` (native cross-platform online UI + in-game update check); only the
-  current protocol is allowed, so every older client is rejected. (History: the
-  protocol was `1.3.1` from 1.7.28 through 1.7.29.)
-- **Build / app version** (currently `1.8.0`) — the shipped client build,
+  layout or the input/match wire format changes. Release 1.8.1 cut the protocol to
+  `1.4.1` (rollback determinism fixes — a 1.8.0 client's save-state differs and
+  would desync); only the current protocol is allowed, so every older client is
+  rejected. (History: `1.3.1` from 1.7.28 through 1.7.29, `1.4.0` for 1.8.0.)
+- **Build / app version** (currently `1.8.1`) — the shipped client build,
   reported to the **in-game update check** via the `VERSION` command (see below).
   The server replies with `LATEST_CLIENT_VERSION` + the GitHub releases URL; the
   game compares it to its baked build version and prompts the player. There is no

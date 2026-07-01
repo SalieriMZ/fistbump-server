@@ -303,21 +303,22 @@ MAX_COUNTED_GAMES = 18
 # Cap on the total size of the (unauthenticated) /api/logs upload directory.
 LOG_DIR_MAX_BYTES = 256 * 1024 * 1024
 
-# Allowed client versions — the current protocol only. Release 1.8.0 cut the
-# protocol to 1.4.0 (native cross-platform online UI + in-game update check);
-# every older client is rejected and prompted to update by the in-game check.
-ALLOWED_VERSIONS = {"1.4.0"}  # 1.4.0 = game protocol (release 1.8.0)
+# Allowed client versions — the current protocol only. Release 1.8.1 cut the
+# protocol to 1.4.1 (rollback determinism fixes); a 1.8.0 client (protocol
+# 1.4.0) has a different save-state and would DESYNC against 1.8.1, so it is
+# rejected here and prompted to update by the in-game check.
+ALLOWED_VERSIONS = {"1.4.1"}  # 1.4.1 = game protocol (release 1.8.1)
 
 # Newest shipped client release, reported to the in-game update check (the
 # VERSION command). The client has no TLS so it can't hit api.github.com
 # directly — it asks the server over the existing TCP line protocol, pre-auth.
-LATEST_CLIENT_VERSION = "1.8.0"
+LATEST_CLIENT_VERSION = "1.8.1"
 UPDATE_RELEASES_URL = "https://github.com/SalieriMZ/3sx-online/releases/latest"
 
 # This broker's own version, reported to the client in the SESSION line so the
 # in-game UI can display the connected server's version. Additive token — older
 # clients parse only the session id and ignore it.
-SERVER_VERSION = "1.8.0"
+SERVER_VERSION = "1.8.1"
 
 ALLOWED_CHAT_SCOPES = {"general", "match", "room"}
 MAX_CHAT_LEN = 256
@@ -1666,7 +1667,11 @@ class FistbumpServer:
     # ---------- Auth (stubbed) ----------
 
     def _check_version(self, session: ClientSession, version: str) -> bool:
-        """Returns True if version allowed, else REJECTs + closes connection."""
+        """Returns True if version is allowed, else False.
+
+        On False the caller sends REJECT; the connection is NOT closed (a
+        rejected client stays connected, bounded only by the hello rate bucket).
+        """
         ip = session.peername[0] if session.peername else "?"
         if not version:
             log.warning("missing version sid=%s ip=%s", session.sid, ip)
@@ -1824,6 +1829,14 @@ class FistbumpServer:
     async def handle_decline(self, session: ClientSession, match_id: str):
         m = self.matches.get(match_id)
         if not m:
+            return
+        # Membership guard: only a participant may decline/cancel a match.
+        # match_ids are publicly enumerable (e.g. via /watch), so without this
+        # any connected (even pre-login) socket could DECLINE a stranger's match
+        # and CANCEL both real participants' live game — a remote grief/DoS.
+        if session.sid not in (m.sid_a, m.sid_b):
+            log.warning("DECLINE rejected: sid=%s not a participant of %s",
+                        session.sid, match_id)
             return
         del self.matches[match_id]
         self.relay_routes.pop(match_id, None)
@@ -2154,6 +2167,27 @@ class FistbumpServer:
                     )
                     del self.matches[mid]
                     self.relay_routes.pop(mid, None)
+
+            # Prune the per-IP anti-abuse dicts so memory doesn't grow with
+            # every unique source IP ever seen (CGNAT churn, port scanners).
+            rate_cutoff = now - RATE_WINDOW_S
+            for ip in list(self.rate_history):
+                buckets = self.rate_history[ip]
+                for bucket in list(buckets):
+                    h = buckets[bucket]
+                    while h and h[0] < rate_cutoff:
+                        h.pop(0)
+                    if not h:
+                        del buckets[bucket]
+                if not buckets:
+                    del self.rate_history[ip]
+            # Drop reject counters only for IPs that have gone fully quiet (no
+            # rate activity within the window) and aren't banned — an actively
+            # offending IP keeps its rate_history, so auto-ban escalation still
+            # accumulates toward the 50-reject threshold.
+            for ip in list(self.reject_count):
+                if ip not in self.bans and ip not in self.rate_history:
+                    del self.reject_count[ip]
 
     # ---------- Stats HTTP ----------
 

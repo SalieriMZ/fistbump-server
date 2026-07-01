@@ -44,7 +44,7 @@ then attach raw TCP clients:
 
 ```sh
 nc localhost 19000
-> HELLO 1.4.0
+> HELLO 1.4.1
 < SESSION <sid>
 > QUEUE casual
 ...

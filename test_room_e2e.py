@@ -61,8 +61,8 @@ async def main():
     a, b = Client("A"), Client("B")
     await a.connect()
     await b.connect()
-    await a.send("REGISTER e2ehost passw0rd 1.4.0 windows")
-    await b.send("REGISTER e2eguest passw0rd 1.4.0 android")
+    await a.send("REGISTER e2ehost passw0rd 1.4.1 windows")
+    await b.send("REGISTER e2eguest passw0rd 1.4.1 android")
     await a.wait_for(lambda l: l.startswith("PROFILE"), desc="A profile")
     await b.wait_for(lambda l: l.startswith("PROFILE"), desc="B profile")
 
