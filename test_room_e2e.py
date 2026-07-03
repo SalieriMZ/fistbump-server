@@ -61,8 +61,8 @@ async def main():
     a, b = Client("A"), Client("B")
     await a.connect()
     await b.connect()
-    await a.send("REGISTER e2ehost passw0rd 1.4.1 windows")
-    await b.send("REGISTER e2eguest passw0rd 1.4.1 android")
+    await a.send("REGISTER e2ehost passw0rd 1.4.3 windows")
+    await b.send("REGISTER e2eguest passw0rd 1.4.3 android")
     await a.wait_for(lambda l: l.startswith("PROFILE"), desc="A profile")
     await b.wait_for(lambda l: l.startswith("PROFILE"), desc="B profile")
 
@@ -82,8 +82,9 @@ async def main():
         st = await a.wait_for(lambda l: "match=" in l and "match=- " not in l, desc="match dispatched")
         mid = re.search(r"match=(\S+)", st).group(1)
         print("match:", mid)
-        await a.send(f"RESULT {mid} 2 1")
-        await b.send(f"RESULT {mid} 1 2")
+        # 5-field RESULT (1.4.3): e2ehost=char 3, e2eguest=char 7.
+        await a.send(f"RESULT {mid} 2 1 3 7")
+        await b.send(f"RESULT {mid} 1 2 7 3")
         line = await a.wait_for(lambda l: f"scores=e2ehost:{expect_host_wins}" in l,
                                 desc=f"scoreboard shows e2ehost:{expect_host_wins}")
         print("scoreboard:", re.search(r"scores=(\S+)", line).group(1))
@@ -114,5 +115,18 @@ for r in rows:
     assert {r[5], r[6]} == {"windows", "android"}, r  # platforms stamped
     assert r[7] is not None, r           # finalized
 
+# Per-game matchup rows (1.9.0 char capture): one per match, canonical
+# char_a=e2ehost(3), char_b=e2eguest(7).
+grows = db.execute(
+    "SELECT match_id, game_no, char_a, char_b, winner FROM games ORDER BY id").fetchall()
+print("games rows:")
+for g in grows:
+    print("  ", g)
+assert len(grows) == 2, grows
+for g in grows:
+    assert g[2] == 3 and g[3] == 7, f"chars not canonical a=3/b=7: {g}"
+    assert g[4] == "e2ehost", g          # per-game winner
+
 proc.terminate()
-print("E2E OK: room create/join/slot, 2 matches incl. rematch, scoreboard 1->2, region+platforms persisted")
+print("E2E OK: room create/join/slot, 2 matches incl. rematch, scoreboard 1->2, "
+      "region+platforms persisted, games matchup rows (char_a=3/char_b=7)")

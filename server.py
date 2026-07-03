@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import string
 import time
@@ -272,14 +273,8 @@ def gen_session_id() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(7))
 
 
-def gen_username() -> str:
-    """7-char anonymous username."""
-    return "u" + "".join(
-        secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)
-    )
-
-
 QUEUE_IDLE_TIMEOUT_S = 300  # 5 min — kick idle queued clients
+SESSION_IDLE_TIMEOUT_S = 180  # reap TCP sessions with no PING/activity (1.9.0 client PINGs every 60s)
 MATCH_PUNCH_TIMEOUT_S = 20  # peers have 20s to UDP-punch (accept) after MATCH
 FINALIZE_GRACE_S = 1800  # keep finalized match relay alive 30min for REMATCH; auto-refreshes per UDP packet in handle_relay
 
@@ -295,30 +290,58 @@ RELAY_RATE_MAX_PER_SEC = 1000
 STATS_CACHE_TTL_S = 5
 
 # Hard ceiling on the cumulative games credited under a single match_id. Each
-# RESULT report carries cumulative PL_Wins (0..9 each), and only the delta vs
-# the already-counted totals is credited per game; this bounds total credited
-# games so a re-finalization loop can't inflate ELO/wins.
-MAX_COUNTED_GAMES = 18
+# RESULT report carries the series' cumulative GAME wins per player (one game =
+# one win, so the totals grow by exactly 1 per game); only the delta vs the
+# already-counted totals is credited per game. This bounds total credited games
+# per match_id so a re-finalization loop can't inflate ELO/wins. Sized for long
+# rematch sets (e.g. first-to-10 → up to 19 games) with headroom.
+MAX_COUNTED_GAMES = 60
+
+# SF3:3S has 20 selectable fighters, My_char id 0 (Gill) .. 19 (Remy). Used to
+# bounds-check the char ids in RESULT before writing per-game matchup stats.
+NUM_CHARACTERS = 20
+
+# ELO tunables (1.9.0). K schedule: fresh accounts (< PLACEMENT_MATCHES ranked
+# games) move fast, established players slower, high-elo players slowest so the
+# top of the ladder is stable. Per-pair same-day dampening kills rematch farming:
+# after K_DAMP_FREE games vs the same opponent in a day, each further game shaves
+# K_DAMP_STEP off the multiplier down to K_DAMP_FLOOR. ELO_FLOOR bounds losses.
+K_PLACEMENT = 64
+K_ESTABLISHED = 32
+K_HIGH = 24
+HIGH_ELO_THRESHOLD = 2600
+K_DAMP_FREE = 2
+K_DAMP_STEP = 0.15
+K_DAMP_FLOOR = 0.25
+ELO_FLOOR = 100
+PAIR_DAMP_WINDOW_S = 86400  # 24h window for per-pair game counting
 
 # Cap on the total size of the (unauthenticated) /api/logs upload directory.
 LOG_DIR_MAX_BYTES = 256 * 1024 * 1024
 
-# Allowed client versions — the current protocol only. Release 1.8.1 cut the
-# protocol to 1.4.1 (rollback determinism fixes); a 1.8.0 client (protocol
-# 1.4.0) has a different save-state and would DESYNC against 1.8.1, so it is
-# rejected here and prompted to update by the in-game check.
-ALLOWED_VERSIONS = {"1.4.1"}  # 1.4.1 = game protocol (release 1.8.1)
+# Allowed client versions. 1.9.0 uses protocol 1.4.3; 1.8.1 uses 1.4.1. Both are
+# accepted during the mixed-version rollout so existing 1.8.1 users keep playing
+# while 1.9.0 is tested against the live servers. SAFE because matchmaking pairs
+# only same-version players (see try_match) — a mixed pair would sync in-match
+# (identical save-state) but report RESULT with different semantics and be marked
+# DISPUTED. 1.4.2 is intentionally NOT accepted (it was never shipped).
+ALLOWED_VERSIONS = {"1.4.1", "1.4.3"}
+
+# Client protocols that send the 1.9.0 PING heartbeat. The idle-session reaper
+# only kicks these (a missing PING means a dead link) + pre-auth sockets; older
+# clients (1.4.1, no heartbeat) may sit idle in the hub/room legitimately.
+HEARTBEAT_VERSIONS = {"1.4.3"}
 
 # Newest shipped client release, reported to the in-game update check (the
 # VERSION command). The client has no TLS so it can't hit api.github.com
 # directly — it asks the server over the existing TCP line protocol, pre-auth.
-LATEST_CLIENT_VERSION = "1.8.1"
+LATEST_CLIENT_VERSION = "1.9.0"
 UPDATE_RELEASES_URL = "https://github.com/SalieriMZ/3sx-online/releases/latest"
 
 # This broker's own version, reported to the client in the SESSION line so the
 # in-game UI can display the connected server's version. Additive token — older
 # clients parse only the session id and ignore it.
-SERVER_VERSION = "1.8.1"
+SERVER_VERSION = "1.9.0"
 
 ALLOWED_CHAT_SCOPES = {"general", "match", "room"}
 MAX_CHAT_LEN = 256
@@ -360,6 +383,7 @@ class ClientSession:
     udp_endpoint: Optional[tuple] = None  # (ip, port) post-NAT seen via UDP
     lan_ips: list = field(default_factory=list)  # all RFC1918 candidates the client advertised via UDP_LAN. Server intersects with the peer's list at START dispatch (/24 prefix match) to pick the right interface for LAN-direct.
     queued_at: float = 0.0  # for idle timeout
+    last_activity: float = field(default_factory=time.time)  # any inbound line / PING; janitor reaps stale
     queue_mode: str = ""  # "casual" or "ranked"
     chat_token_bucket: float = 5.0  # tokens; 5 msgs/sec capacity
     chat_last_refill: float = 0.0
@@ -509,11 +533,51 @@ class FistbumpServer:
             )
         """)
         # Additive columns (1.7.28): where the match was played + on what.
-        for _col in ("region TEXT", "platform_a TEXT", "platform_b TEXT"):
+        # (1.9.0): is_ranked lets the per-pair K-dampening query filter ranked-only.
+        for _col in ("region TEXT", "platform_a TEXT", "platform_b TEXT",
+                     "is_ranked INTEGER NOT NULL DEFAULT 0"):
             try:
                 self.db.execute(f"ALTER TABLE matches ADD COLUMN {_col}")
             except sqlite3.OperationalError:
                 pass  # already migrated
+        # Additive columns (1.9.0): ranked W/L kept separate from casual wins/
+        # losses so placement + rank tiers reflect ranked play only.
+        for _col in ("ranked_wins INTEGER NOT NULL DEFAULT 0",
+                     "ranked_losses INTEGER NOT NULL DEFAULT 0"):
+            try:
+                self.db.execute(f"ALTER TABLE users ADD COLUMN {_col}")
+            except sqlite3.OperationalError:
+                pass  # already migrated
+        # Per-game matchup rows (1.9.0): one row per game finished, incl. rematch
+        # series (game_no is the cumulative series game count). char_a/char_b are
+        # user_a/user_b's fighter ids (nullable — legacy 3-field RESULTs or
+        # out-of-range values store NULL). Feeds character-usage / matchup stats.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT NOT NULL,
+                game_no INTEGER NOT NULL,
+                char_a INTEGER,
+                char_b INTEGER,
+                winner TEXT,
+                is_ranked INTEGER NOT NULL DEFAULT 0,
+                ts INTEGER NOT NULL
+            )
+        """)
+        # Additive columns (1.9.0): per-game ELO delta from user_a/user_b's view,
+        # so the web match history can show each rematch game as its own row with
+        # its own rating change instead of the matches row (one per match_id) that
+        # gets overwritten every game of an in-game rematch. 0 for casual/legacy.
+        for _col in ("elo_delta_a INTEGER NOT NULL DEFAULT 0",
+                     "elo_delta_b INTEGER NOT NULL DEFAULT 0"):
+            try:
+                self.db.execute(f"ALTER TABLE games ADD COLUMN {_col}")
+            except sqlite3.OperationalError:
+                pass  # already migrated
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_games_match ON games(match_id)")
+        # Index the per-game history scan (user page reads games by participant
+        # ordered by time) so it doesn't full-scan the games table.
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_games_ts ON games(ts)")
         # Index the leaderboard scan's filter column so the per-request
         # completed-match aggregation (and /metrics counts) don't full-scan.
         self.db.execute(
@@ -536,20 +600,13 @@ class FistbumpServer:
         cur = self.db.execute("SELECT username, password_hash, elo, wins, losses FROM users WHERE username=?", (username,))
         return cur.fetchone()
 
-    def db_create_user(self, username: str, password: str):
-        self.db.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-            (username, hash_password(password), int(time.time())),
-        )
-        self.db.commit()
-
     def db_touch_login(self, username: str):
         self.db.execute("UPDATE users SET last_login_at=? WHERE username=?", (int(time.time()), username))
         self.db.commit()
 
     # PBKDF2 at 200k iterations is tens of ms of pure CPU; running it inline on
-    # the event loop lets a LOGIN/REGISTER flood stall all matchmaking (audit
-    # 4.2). These wrappers push the hashing onto a worker thread. The DB write
+    # the event loop lets a LOGIN/REGISTER flood stall all matchmaking. These
+    # wrappers push the hashing onto a worker thread. The DB write
     # itself stays on the loop (fast, indexed) to keep self.db single-threaded.
     async def _verify_password_async(self, password: str, stored: str) -> bool:
         return await asyncio.to_thread(verify_password, password, stored)
@@ -681,6 +738,7 @@ class FistbumpServer:
                 if not cmd:
                     continue
                 log.info("← %s: %s", sid, cmd)
+                session.last_activity = time.time()
                 await self.handle_cmd(session, cmd)
         except (ConnectionResetError, asyncio.IncompleteReadError):
             pass
@@ -691,6 +749,11 @@ class FistbumpServer:
             log.info("disconnect sid=%s", sid)
 
     async def handle_cmd(self, session: ClientSession, cmd: str):
+        if cmd == "PING":
+            # Heartbeat (1.9.0). last_activity was already stamped by the read
+            # loop; just answer so the client's dead-link timer stays armed.
+            await self.send(session, "PONG")
+            return
         if cmd == "VERSION" or cmd.startswith("VERSION "):
             # Pre-auth in-game update check. Does NOT require login (the client
             # checks its version before logging in) and does NOT close the
@@ -1101,6 +1164,16 @@ class FistbumpServer:
         PERSISTS across the match — slots stay, members stay, settings
         stay. _after_match_finalize re-broadcasts ROOM STATE with
         match=- so the room overlay knows it can START again."""
+        # Same-version guard (mixed-version rollout): the two slotted players
+        # must share a protocol version, or their RESULT reports would mismatch
+        # and DISPUTE the match. Refuse the start and tell the host instead.
+        if a.version != b.version:
+            log.info("ROOM %s start refused: version mismatch %s vs %s",
+                     room.code, a.version or "?", b.version or "?")
+            host = self.sessions.get(room.host_sid)
+            if host:
+                await self.send(host, "REJECT room players are on different game versions")
+            return
         # Clear any stale UDP endpoint snapshots from a prior match in this
         # room. handle_udp gates the START dispatch on both peers having
         # udp_endpoint set — if either side carried over its old endpoint
@@ -1124,12 +1197,12 @@ class FistbumpServer:
         self.matches[match_id] = pm
         room.current_match_id = match_id
         def _do(match_id=match_id, a_user=a.username, b_user=b.username,
-                a_plat=a.platform, b_plat=b.platform):
+                a_plat=a.platform, b_plat=b.platform, is_r=int(pm.is_ranked)):
             self.db.execute(
-                "INSERT INTO matches (id, p1, p2, created_at, region, platform_a, platform_b)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO matches (id, p1, p2, created_at, region, platform_a, platform_b, is_ranked)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (match_id, a_user, b_user, int(time.time()),
-                 self.region_code, a_plat or None, b_plat or None),
+                 self.region_code, a_plat or None, b_plat or None, is_r),
             )
             self.db.commit()
         try:
@@ -1142,24 +1215,40 @@ class FistbumpServer:
         b.state = "matched"
         log.info("ROOM MATCH %s: %s vs %s (from room %s, members=%d)",
                  match_id, a.username, b.username, room.code, len(room.members))
-        await self.send(a, f"MATCH {match_id} {b.username}")
-        await self.send(b, f"MATCH {match_id} {a.username}")
+        elo_a, elo_b = self._elo_of(a.username), self._elo_of(b.username)
+        await self.send(a, f"MATCH {match_id} {b.username} {elo_a} {elo_b}")
+        await self.send(b, f"MATCH {match_id} {a.username} {elo_b} {elo_a}")
         await self._broadcast_room_state(room)
 
     async def handle_result(self, session: ClientSession, payload: str):
-        """RESULT <match_id> <my_wins> <opp_wins>"""
+        """RESULT <match_id> <my_wins> <opp_wins> [<my_char> <opp_char>]
+
+        The two char ids are additive (1.4.3): a 3-field RESULT still finalizes,
+        just with NULL matchup chars."""
         parts = payload.split()
-        if len(parts) != 3:
+        if len(parts) not in (3, 5):
             log.warning("malformed RESULT sid=%s: %r", session.sid, payload)
             return
-        match_id, my_wins_s, opp_wins_s = parts
+        match_id, my_wins_s, opp_wins_s = parts[0], parts[1], parts[2]
         try:
             my_wins = int(my_wins_s)
             opp_wins = int(opp_wins_s)
         except ValueError:
             return
-        # Sanity bounds (3rd Strike best-of-3 rounds normally, allow up to 9)
-        if not (0 <= my_wins <= 9 and 0 <= opp_wins <= 9):
+        # Optional fighter ids — out-of-range stores NULL (never rejects: chars
+        # are auxiliary stats, only the win concordance can dispute a match).
+        my_char = opp_char = None
+        if len(parts) == 5:
+            def _bounded_char(s):
+                try:
+                    v = int(s)
+                except ValueError:
+                    return None
+                return v if 0 <= v < NUM_CHARACTERS else None
+            my_char = _bounded_char(parts[3])
+            opp_char = _bounded_char(parts[4])
+        # Sanity bounds: cumulative per-series game wins, one per game.
+        if not (0 <= my_wins <= MAX_COUNTED_GAMES and 0 <= opp_wins <= MAX_COUNTED_GAMES):
             log.warning("RESULT out of bounds sid=%s: %s/%s", session.sid, my_wins, opp_wins)
             return
 
@@ -1168,9 +1257,9 @@ class FistbumpServer:
             return
         if m.finalized:
             # In-game rematch: the session keeps playing under the same
-            # match_id and re-reports cumulative PL_Wins after every game.
-            # A report extending the already-counted totals reopens the
-            # match; the finalize path credits only the new game (delta).
+            # match_id and re-reports the series' cumulative game wins after
+            # every game. A report extending the already-counted totals reopens
+            # the match; the finalize path credits only the new game (delta).
             counted = getattr(m, "counted", None) or (0, 0)
             if (my_wins + opp_wins) <= (counted[0] + counted[1]):
                 return  # duplicate/stale report of an already-counted game
@@ -1183,9 +1272,20 @@ class FistbumpServer:
 
         if session.sid == m.sid_a:
             m.result_a = (my_wins, opp_wins)
+            # From A's view my_char is A's fighter; char_a is canonically user_a's
+            # (= p1) fighter so the games row matches the matches.p1/p2 ordering.
+            if my_char is not None:
+                m.char_a = my_char  # type: ignore[attr-defined]
+            if opp_char is not None:
+                m.char_b = opp_char  # type: ignore[attr-defined]
         else:
             m.result_b = (my_wins, opp_wins)
-        log.info("RESULT match=%s from sid=%s wins=%d/%d", match_id, session.sid, my_wins, opp_wins)
+            if my_char is not None:
+                m.char_b = my_char  # type: ignore[attr-defined]
+            if opp_char is not None:
+                m.char_a = opp_char  # type: ignore[attr-defined]
+        log.info("RESULT match=%s from sid=%s wins=%d/%d chars=%s/%s",
+                 match_id, session.sid, my_wins, opp_wins, my_char, opp_char)
 
         # Wait for both
         if m.result_a is None or m.result_b is None:
@@ -1226,6 +1326,11 @@ class FistbumpServer:
         prev_counted = getattr(m, "counted", None) or (0, 0)
         delta_a = a_wins - prev_counted[0]
         delta_b = b_wins - prev_counted[1]
+        if delta_a < 0 or delta_b < 0:
+            # Impossible under correct cumulative (monotonic) reporting — a
+            # per-series total can only grow. Flags a buggy/old/hostile client.
+            log.warning("RESULT non-monotonic match=%s: counted=%s new=%d/%d",
+                        match_id, prev_counted, a_wins, b_wins)
         m.counted = (a_wins, b_wins)  # type: ignore[attr-defined]
         game_winner = None if delta_a == delta_b else (m.user_a if delta_a > delta_b else m.user_b)
         m.game_winner = game_winner  # type: ignore[attr-defined]
@@ -1240,6 +1345,8 @@ class FistbumpServer:
                 "region": self.region_code,
                 "platform_a": getattr(m, "platform_a", "") or "",
                 "platform_b": getattr(m, "platform_b", "") or "",
+                "char_a": getattr(m, "char_a", None),
+                "char_b": getattr(m, "char_b", None),
             })
             m.finalized = True
             m.finalized_at = time.time()
@@ -1247,7 +1354,9 @@ class FistbumpServer:
             return
         # Single money path (TIE when game_winner is None — delta_a == delta_b).
         outcome = await self._finalize_outcome(
-            match_id, m.user_a, m.user_b, delta_a, delta_b, m.is_ranked)
+            match_id, m.user_a, m.user_b, delta_a, delta_b, m.is_ranked,
+            char_a=getattr(m, "char_a", None), char_b=getattr(m, "char_b", None),
+            game_no=(a_wins + b_wins))
         if outcome == "TIE":
             log.info("match %s ended as TIE", match_id)
         m.finalized = True
@@ -1274,86 +1383,139 @@ class FistbumpServer:
             m.game_winner = None  # consumed
         await self._broadcast_room_state(room)
 
-    async def _apply_elo(self, match_id: str, winner: str, loser: str):
-        """Standard ELO update with K=32."""
-        K = 32
+    def _elo_k(self, match_id: str, a: str, b: str, ra: int, rb: int) -> float:
+        """K-factor for this game: placement/established/high by ranked games
+        played + elo, then per-pair same-day dampening to defang rematch farming.
+        Sync — reads run on the loop thread (small PK/indexed queries, like the
+        elo fetch in _apply_elo)."""
         try:
-            row_w = self.db.execute("SELECT elo FROM users WHERE username=?", (winner,)).fetchone()
-            row_l = self.db.execute("SELECT elo FROM users WHERE username=?", (loser,)).fetchone()
+            ga = self.db.execute(
+                "SELECT ranked_wins+ranked_losses FROM users WHERE username=?", (a,)).fetchone()
+            gb = self.db.execute(
+                "SELECT ranked_wins+ranked_losses FROM users WHERE username=?", (b,)).fetchone()
+            ga = ga[0] if ga else 0
+            gb = gb[0] if gb else 0
+        except Exception:
+            ga = gb = 0
+        if ga < PLACEMENT_MATCHES or gb < PLACEMENT_MATCHES:
+            base = K_PLACEMENT
+        elif ra >= HIGH_ELO_THRESHOLD and rb >= HIGH_ELO_THRESHOLD:
+            base = K_HIGH
+        else:
+            base = K_ESTABLISHED
+        # Distinct match_ids (each fresh queue = one row) are the farming unit; an
+        # in-game best-of series shares one match_id and counts once. Exclude the
+        # current id so a rematch re-finalize can't self-inflate the count.
+        try:
+            cutoff = int(time.time()) - PAIR_DAMP_WINDOW_S
+            pair_games = self.db.execute(
+                "SELECT COUNT(*) FROM matches WHERE completed_at IS NOT NULL "
+                "AND completed_at>=? AND is_ranked=1 AND winner<>'DISPUTED' AND id<>? "
+                "AND ((p1=? AND p2=?) OR (p1=? AND p2=?))",
+                (cutoff, match_id, a, b, b, a)).fetchone()[0]
+        except Exception:
+            pair_games = 0
+        damp = max(K_DAMP_FLOOR, 1.0 - K_DAMP_STEP * max(0, pair_games - K_DAMP_FREE))
+        return base * damp
+
+    async def _apply_elo(self, match_id: str, player_a: str, player_b: str, score_a: float) -> int:
+        """ELO update for a ranked game. score_a is player_a's score in {1.0 win,
+        0.5 tie, 0.0 loss}. Single rounded delta d → winner +d / loser -d (exact
+        zero-sum above ELO_FLOOR). Also splits ranked_wins/ranked_losses and
+        writes the matches row (winner label incl. 'TIE'). Returns player_a's
+        rating delta d (b gets -d); 0 when skipped (anon/error)."""
+        try:
+            row_a = self.db.execute("SELECT elo FROM users WHERE username=?", (player_a,)).fetchone()
+            row_b = self.db.execute("SELECT elo FROM users WHERE username=?", (player_b,)).fetchone()
         except Exception as e:
             log.warning("elo fetch failed: %s", e)
-            return
-        if not row_w or not row_l:
-            # Anon participant — skip ELO
+            return 0
+        if not row_a or not row_b:
+            # Anon participant — skip ELO but still stamp the match outcome.
             log.info("skip ELO match=%s (anon participant)", match_id)
-            return
-        ra, rb = row_w[0], row_l[0]
+            winner_lbl = "TIE" if score_a == 0.5 else (player_a if score_a > 0.5 else player_b)
+            def _do_anon(match_id=match_id, winner_lbl=winner_lbl):
+                self.db.execute(
+                    "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
+                    (winner_lbl, int(time.time()), match_id))
+                self.db.commit()
+            try:
+                await self._db_write(_do_anon)
+            except Exception:
+                pass
+            return 0
+        ra, rb = row_a[0], row_b[0]
         ea = 1.0 / (1.0 + 10 ** ((rb - ra) / 400.0))
-        eb = 1.0 - ea
-        new_ra = ra + K * (1.0 - ea)
-        new_rb = rb + K * (0.0 - eb)
-        delta_w = int(round(new_ra - ra))
-        delta_l = int(round(new_rb - rb))
-        # Resolve which match column gets which delta on the loop (reads the
-        # shared self.matches dict) so the worker thread does pure DB work.
-        p1_delta = delta_w if winner == self.matches[match_id].user_a else delta_l
-        p2_delta = delta_w if winner == self.matches[match_id].user_b else delta_l
-        def _do(match_id=match_id, winner=winner, loser=loser,
-                delta_w=delta_w, delta_l=delta_l,
-                p1_delta=p1_delta, p2_delta=p2_delta):
-            self.db.execute(
-                "UPDATE users SET elo=elo+?, wins=wins+1 WHERE username=?",
-                (delta_w, winner),
-            )
-            self.db.execute(
-                "UPDATE users SET elo=MAX(0, elo+?), losses=losses+1 WHERE username=?",
-                (delta_l, loser),
-            )
+        K = self._elo_k(match_id, player_a, player_b, ra, rb)
+        d = int(round(K * (score_a - ea)))   # player_a's delta; b gets -d (zero-sum)
+        winner_lbl = "TIE" if score_a == 0.5 else (player_a if score_a > 0.5 else player_b)
+        def _do(match_id=match_id, a=player_a, b=player_b, d=d, score_a=score_a,
+                winner_lbl=winner_lbl):
+            self.db.execute("UPDATE users SET elo=MAX(?, elo+?) WHERE username=?",
+                            (ELO_FLOOR, d, a))
+            self.db.execute("UPDATE users SET elo=MAX(?, elo+?) WHERE username=?",
+                            (ELO_FLOOR, -d, b))
+            if score_a == 1.0:
+                self.db.execute("UPDATE users SET ranked_wins=ranked_wins+1 WHERE username=?", (a,))
+                self.db.execute("UPDATE users SET ranked_losses=ranked_losses+1 WHERE username=?", (b,))
+            elif score_a == 0.0:
+                self.db.execute("UPDATE users SET ranked_wins=ranked_wins+1 WHERE username=?", (b,))
+                self.db.execute("UPDATE users SET ranked_losses=ranked_losses+1 WHERE username=?", (a,))
+            # tie (0.5): ELO only, no W/L bump (no ranked_draws column yet).
             self.db.execute(
                 "UPDATE matches SET winner=?, p1_elo_delta=?, p2_elo_delta=?, completed_at=? WHERE id=?",
-                (winner, p1_delta, p2_delta, int(time.time()), match_id),
-            )
+                (winner_lbl, d, -d, int(time.time()), match_id))
             self.db.commit()
         try:
             await self._db_write(_do)
         except Exception as e:
             log.warning("elo update failed: %s", e)
-            return
-        log.info(
-            "ELO match=%s %s +%d (→%d) vs %s %d (→%d)",
-            match_id, winner, delta_w, ra + delta_w, loser, delta_l, rb + delta_l,
-        )
+            return 0
+        log.info("ELO match=%s K=%.1f %s %+d (→%d) / %s %+d (→%d) score_a=%.1f",
+                 match_id, K, player_a, d, ra + d, player_b, -d, rb - d, score_a)
+        return d
 
     async def _finalize_outcome(self, match_id: str, user_a: str, user_b: str,
-                                delta_a: int, delta_b: int, is_ranked: bool) -> str:
+                                delta_a: int, delta_b: int, is_ranked: bool,
+                                char_a=None, char_b=None, game_no=None) -> str:
         """The single money path. Given the per-side win deltas for the game
         that just completed, write the outcome and return the winner username
         ('TIE' when drawn). Ranked → ELO; casual → wins/losses bump. The TCP
         RESULT path and the internal (edge→leader) result path both delegate
-        here so the two finalize implementations can't drift."""
-        if delta_a == delta_b:
-            def _do(match_id=match_id):
+        here so the two finalize implementations can't drift. char_a/char_b/
+        game_no (optional) record a per-game matchup row in the games table."""
+        game_delta_a = 0  # user_a's ELO change for THIS game (0 = casual/tie/anon)
+        if is_ranked:
+            # Ranked always routes through ELO, ties included (Elo draw S=0.5
+            # transfers rating toward the lower-seeded player, 0 when equal).
+            if delta_a == delta_b:
+                score_a = 0.5
+            elif delta_a > delta_b:
+                score_a = 1.0
+            else:
+                score_a = 0.0
+            game_delta_a = await self._apply_elo(match_id, user_a, user_b, score_a)
+            result = "TIE" if score_a == 0.5 else (user_a if score_a == 1.0 else user_b)
+        elif delta_a == delta_b:
+            # Casual tie: record TIE, no wins/losses bump.
+            def _do_tie(match_id=match_id):
                 self.db.execute(
                     "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
-                    ("TIE", int(time.time()), match_id),
-                )
+                    ("TIE", int(time.time()), match_id))
                 self.db.commit()
             try:
-                await self._db_write(_do)
+                await self._db_write(_do_tie)
             except Exception:
                 pass
-            return "TIE"
-        winner = user_a if delta_a > delta_b else user_b
-        loser = user_b if winner == user_a else user_a
-        if is_ranked:
-            await self._apply_elo(match_id, winner, loser)
+            result = "TIE"
         else:
-            # Casual: bump wins/losses (visible on leaderboard) but skip ELO.
+            # Casual win: bump wins/losses (visible on leaderboard) but skip ELO.
+            winner = user_a if delta_a > delta_b else user_b
+            loser = user_b if winner == user_a else user_a
             def _do(match_id=match_id, winner=winner, loser=loser):
                 self.db.execute(
                     "UPDATE matches SET winner=?, completed_at=? WHERE id=?",
-                    (winner, int(time.time()), match_id),
-                )
+                    (winner, int(time.time()), match_id))
                 self.db.execute("UPDATE users SET wins=wins+1 WHERE username=?", (winner,))
                 self.db.execute("UPDATE users SET losses=losses+1 WHERE username=?", (loser,))
                 self.db.commit()
@@ -1362,7 +1524,23 @@ class FistbumpServer:
             except Exception:
                 pass
             log.info("casual match %s done — %s beat %s (no ELO change)", match_id, winner, loser)
-        return winner
+            result = winner
+        # Per-game matchup row (best-effort — a games-insert failure must never
+        # block the outcome above). game_no defaults to the series game count.
+        def _do_game(match_id=match_id, gno=(game_no if game_no is not None else 0),
+                     ca=char_a, cb=char_b, w=result, r=int(is_ranked),
+                     da=int(game_delta_a), db_=-int(game_delta_a)):
+            self.db.execute(
+                "INSERT INTO games (match_id, game_no, char_a, char_b, winner, is_ranked, ts,"
+                " elo_delta_a, elo_delta_b)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (match_id, gno, ca, cb, w, r, int(time.time()), da, db_))
+            self.db.commit()
+        try:
+            await self._db_write(_do_game)
+        except Exception as e:
+            log.warning("games row insert failed match=%s: %s", match_id, e)
+        return result
 
     async def _handle_internal_auth(self, body: dict) -> dict:
         """Upstream endpoint: register/login/refresh. Validates against local DB,
@@ -1412,6 +1590,10 @@ class FistbumpServer:
             "display": username,
             "token": token,
             "expiry": expiry,
+            # The leader owns the users/games DB; hand the edge a ready-built
+            # PROFILE line so sa-east-1 players see real elo/rank/main-char
+            # instead of the edge's empty-DB defaults.
+            "profile_line": self._profile_line(username),
         }
 
     async def _handle_internal_result(self, body: dict) -> dict:
@@ -1423,12 +1605,20 @@ class FistbumpServer:
         a_wins = int(body.get("a_wins") or 0)
         b_wins = int(body.get("b_wins") or 0)
         is_ranked = bool(body.get("is_ranked"))
+        def _bounded_char(v):
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                return None
+            return v if 0 <= v < NUM_CHARACTERS else None
+        char_a = _bounded_char(body.get("char_a"))
+        char_b = _bounded_char(body.get("char_b"))
         if not match_id or not user_a or not user_b:
             return {"ok": False, "reject": "missing fields"}
         # Mirror the TCP path's per-report clamp + cumulative cap:
         # the internal path previously trusted unbounded a_wins/b_wins, so a
         # bearer holder could fabricate huge ELO swings.
-        if not (0 <= a_wins <= 9 and 0 <= b_wins <= 9):
+        if not (0 <= a_wins <= MAX_COUNTED_GAMES and 0 <= b_wins <= MAX_COUNTED_GAMES):
             return {"ok": False, "reject": "wins out of bounds"}
         if (a_wins + b_wins) > MAX_COUNTED_GAMES:
             return {"ok": False, "reject": "cumulative over cap"}
@@ -1436,12 +1626,13 @@ class FistbumpServer:
         # inserted here). Insert lazily so completion writes succeed.
         try:
             self.db.execute(
-                "INSERT OR IGNORE INTO matches (id, p1, p2, created_at, region, platform_a, platform_b)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO matches (id, p1, p2, created_at, region, platform_a, platform_b, is_ranked)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (match_id, user_a, user_b, int(time.time()),
                  body.get("region") or "unknown",
                  body.get("platform_a") or None,
-                 body.get("platform_b") or None),
+                 body.get("platform_b") or None,
+                 int(is_ranked)),
             )
             self.db.commit()
         except Exception as e:
@@ -1464,7 +1655,8 @@ class FistbumpServer:
             m_stub.counted = (a_wins, b_wins)  # type: ignore[attr-defined]
         # Same money path as the TCP RESULT handler.
         winner = await self._finalize_outcome(
-            match_id, user_a, user_b, delta_a, delta_b, is_ranked)
+            match_id, user_a, user_b, delta_a, delta_b, is_ranked,
+            char_a=char_a, char_b=char_b, game_no=(a_wins + b_wins))
         if winner == "TIE":
             log.info("(internal) match %s TIE", match_id)
         else:
@@ -1533,7 +1725,9 @@ class FistbumpServer:
         session.username = username
         session.state = "logged_in"
         await self.send(session, f"TOKEN refresh {token} {expiry}")
-        await self.send(session, f"PROFILE {display}")
+        # Prefer the leader-computed PROFILE (real stats); fall back to the local
+        # line only if talking to an older leader that doesn't send it.
+        await self.send(session, resp.get("profile_line") or self._profile_line(username))
         log.info("%s sid=%s ip=%s user=%s (via upstream)", action.upper(), session.sid, ip, username)
         await self._rebind_user_rooms(session)
         return True
@@ -1607,16 +1801,64 @@ class FistbumpServer:
         log.info("LOGIN sid=%s ip=%s user=%s elo=%d", session.sid, ip, username, row[2])
         await self._issue_session(session, username)
 
+    def _elo_of(self, username: str) -> int:
+        """Best-effort current ELO for the MATCH-line tokens. 0 = unknown
+        (anon, or an edge node whose local DB has no user rows)."""
+        try:
+            row = self.db.execute(
+                "SELECT elo FROM users WHERE username=?", (username,)).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def _profile_line(self, username: str) -> str:
+        """PROFILE <username> <elo> <rank_tier> <rank_sub> <main_char>. The four
+        trailing fields are additive (1.9.0) — a client that only reads the
+        username still works. rank_tier is 'Unranked' during placement; main_char
+        is the most-played fighter id (-1 with no recorded games). Best-effort:
+        any DB hiccup (or an edge node without the user row) falls back to
+        neutral defaults so login never blocks on stats."""
+        try:
+            row = self.db.execute(
+                "SELECT elo, ranked_wins, ranked_losses FROM users WHERE username=?",
+                (username,)).fetchone()
+        except Exception:
+            row = None
+        if not row:
+            return f"PROFILE {username} 1000 Unranked 0 -1"
+        elo = row[0]
+        ranked_total = (row[1] or 0) + (row[2] or 0)
+        if ranked_total < PLACEMENT_MATCHES:
+            tier, sub = "Unranked", 0
+        else:
+            r = sf6_rank(elo, ranked_total)
+            tier, sub = r["tier"], (r["sub"] or 0)
+        main_char = -1
+        try:
+            mc = self.db.execute(
+                "SELECT ch, COUNT(*) c FROM ("
+                " SELECT g.char_a AS ch FROM games g JOIN matches m ON g.match_id=m.id"
+                "  WHERE m.p1=? AND g.char_a IS NOT NULL"
+                " UNION ALL"
+                " SELECT g.char_b FROM games g JOIN matches m ON g.match_id=m.id"
+                "  WHERE m.p2=? AND g.char_b IS NOT NULL"
+                ") GROUP BY ch ORDER BY c DESC LIMIT 1",
+                (username, username)).fetchone()
+            if mc:
+                main_char = mc[0]
+        except Exception:
+            pass
+        return f"PROFILE {username} {elo} {tier} {sub} {main_char}"
+
     async def _issue_session(self, session: ClientSession, username: str):
         """Send TOKEN + PROFILE to a now-authenticated session."""
         session.username = username
         session.state = "logged_in"
         token, expiry = issue_token(username)
         await self.send(session, f"TOKEN refresh {token} {expiry}")
-        # Full username — 1.7.28+ clients parse up to 63 chars; the room
-        # overlay compares it against ROOM STATE names for host/slot detection.
-        display = username
-        await self.send(session, f"PROFILE {display}")
+        # Full username (first token) + additive elo/rank/main-char stats. The
+        # room overlay compares the username against ROOM STATE names.
+        await self.send(session, self._profile_line(username))
         await self._rebind_user_rooms(session)
 
     async def _rebind_user_rooms(self, session: ClientSession):
@@ -1741,8 +1983,6 @@ class FistbumpServer:
         log.info("REFRESH sid=%s ip=%s user=%s", session.sid, ip, username)
         await self._issue_session(session, username)
 
-    # complete_login replaced by _issue_session (DB-backed) and complete_login_anon
-
     # ---------- Queue / match ----------
 
     async def handle_queue_add(self, session: ClientSession, mode: str):
@@ -1783,9 +2023,34 @@ class FistbumpServer:
     async def try_match(self):
         # Try ranked first, then casual
         for queue, is_ranked in [(self.queue_ranked, True), (self.queue_casual, False)]:
-            while len(queue) >= 2:
-                sid_a = queue.pop(0)
-                sid_b = queue.pop(0)
+            # Drop dead sids so the version scan only sees live sessions.
+            queue[:] = [s for s in queue if self.sessions.get(s) is not None]
+            while True:
+                # Pair only players on the SAME protocol version. The RESULT wire
+                # semantics changed across 1.4.x (per-game round score -> series
+                # cumulative game wins), so a mixed 1.4.1/1.4.3 pair would report
+                # inconsistent results and be marked DISPUTED. This also keeps
+                # 1.8.1 users and 1.9.0 testers in separate pools during the
+                # mixed-version rollout (the match itself would sync — same
+                # save-state — but crediting would break).
+                sid_a = sid_b = None
+                for i in range(len(queue)):
+                    a = self.sessions.get(queue[i])
+                    if a is None:
+                        continue
+                    for j in range(i + 1, len(queue)):
+                        b = self.sessions.get(queue[j])
+                        if b is None:
+                            continue
+                        if a.version == b.version:
+                            sid_a, sid_b = queue[i], queue[j]
+                            queue.pop(j)  # j > i: remove the later index first
+                            queue.pop(i)
+                            break
+                    if sid_a is not None:
+                        break
+                if sid_a is None:
+                    break  # no same-version pair available in this queue
                 a = self.sessions.get(sid_a)
                 b = self.sessions.get(sid_b)
                 if not a or not b:
@@ -1805,12 +2070,12 @@ class FistbumpServer:
                 pm.platform_b = b.platform  # type: ignore[attr-defined]
                 self.matches[match_id] = pm
                 def _do(match_id=match_id, a_user=a.username, b_user=b.username,
-                        a_plat=a.platform, b_plat=b.platform):
+                        a_plat=a.platform, b_plat=b.platform, is_r=int(is_ranked)):
                     self.db.execute(
-                        "INSERT INTO matches (id, p1, p2, created_at, region, platform_a, platform_b)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO matches (id, p1, p2, created_at, region, platform_a, platform_b, is_ranked)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (match_id, a_user, b_user, int(time.time()),
-                         self.region_code, a_plat or None, b_plat or None),
+                         self.region_code, a_plat or None, b_plat or None, is_r),
                     )
                     self.db.commit()
                 try:
@@ -1823,8 +2088,9 @@ class FistbumpServer:
                 b.state = "matched"
                 mode_label = "ranked" if is_ranked else "casual"
                 log.info("MATCH %s [%s]: %s vs %s", match_id, mode_label, a.username, b.username)
-                await self.send(a, f"MATCH {match_id} {b.username}")
-                await self.send(b, f"MATCH {match_id} {a.username}")
+                elo_a, elo_b = self._elo_of(a.username), self._elo_of(b.username)
+                await self.send(a, f"MATCH {match_id} {b.username} {elo_a} {elo_b}")
+                await self.send(b, f"MATCH {match_id} {a.username} {elo_b} {elo_a}")
 
     async def handle_decline(self, session: ClientSession, match_id: str):
         m = self.matches.get(match_id)
@@ -1840,15 +2106,42 @@ class FistbumpServer:
             return
         del self.matches[match_id]
         self.relay_routes.pop(match_id, None)
+        now = time.time()
         for sid in (m.sid_a, m.sid_b):
             s = self.sessions.get(sid)
-            if s and s.sid != session.sid:
-                await self.send(s, f"CANCEL {match_id}")
+            if not s:
+                continue
+            # Clear the post-NAT endpoint at every match-teardown site so a
+            # stale mapping can't leak into the next pairing (see the pair-match
+            # invariant elsewhere).
+            s.udp_endpoint = None
+            if s.sid == session.sid:
+                continue
+            # Innocent peer: tell them WHY (additive reason token; older clients
+            # only read the id) and put them back where they came from instead
+            # of silently dropping them out of the queue.
+            if s.room_code is None and s.queue_mode:
+                queue = self.queue_ranked if s.queue_mode == "ranked" else self.queue_casual
+                if s.sid not in queue:
+                    queue.append(s.sid)
+                s.state = "queued"
+                s.queued_at = now
+                s.match_id = None
+                await self.send(s, f"CANCEL {match_id} declined")
+                await self.send(s, f"QUEUE requeued {s.queue_mode}")
+            else:
+                # Room member (or a peer with no queue to return to): just cancel
+                # back to idle. The room's Start button re-enables on the next
+                # room-state broadcast.
                 s.state = "logged_in"
                 s.match_id = None
+                await self.send(s, f"CANCEL {match_id} declined")
         session.state = "logged_in"
         session.match_id = None
         log.info("DECLINE %s by sid=%s", match_id, session.sid)
+        # A requeued innocent peer may now pair with someone already waiting —
+        # run the matcher (no-op if the queues can't form a pair).
+        await self.try_match()
 
     # ---------- UDP handler (NAT punch + START dispatch) ----------
 
@@ -1956,6 +2249,9 @@ class FistbumpServer:
         # Wire format: 36 chars uuid + 1 char side + payload.
         if len(data) < 37:
             return
+        if len(data) > 2048:
+            return  # oversized — the GekkoNet stream is far under 2KB/datagram;
+                    # drop flood/amplification traffic before any work.
         uuid = data[:36].decode("ascii", errors="ignore")
         side = chr(data[36])
         if side not in ("1", "2"):
@@ -2029,7 +2325,8 @@ class FistbumpServer:
         payload[36] = ord(other_side)
         if self.relay_transport is not None:
             try:
-                self.relay_transport.sendto(bytes(payload), dst)
+                # sendto accepts a bytearray directly — no extra bytes() copy.
+                self.relay_transport.sendto(payload, dst)
             except Exception as e:
                 log.warning("relay sendto %s failed: %s", dst, e)
 
@@ -2065,6 +2362,76 @@ class FistbumpServer:
                     continue
                 other_sid = m.sid_b if sid == m.sid_a else m.sid_a
                 other = self.sessions.get(other_sid)
+                # Forfeit-on-drop: if gameplay had started and the PEER already
+                # reported a RESULT this game but the DROPPER had not, credit the
+                # game to the peer instead of voiding the result (rage-quit =
+                # loss). Guards: m.started (no pre-gameplay forfeits); xor
+                # peer_reported and not dropper_reported (a mutual drop, where
+                # neither reported, falls through to the plain cancel — nobody is
+                # punished; a concordant both-report would already be finalized
+                # above and skipped).
+                dropper_reported = (m.result_a if sid == m.sid_a else m.result_b) is not None
+                peer_reported = (m.result_b if sid == m.sid_a else m.result_a) is not None
+                # Decide the current game from the surviving peer's OWN report
+                # rather than assuming the peer won — a peer who honestly reports
+                # its own loss (opponent KO'd it, then that opponent crashed
+                # before flushing its RESULT) must not be handed a forfeit win.
+                forfeit_done = False
+                if m.started and peer_reported and not dropper_reported:
+                    prev = getattr(m, "counted", None) or (0, 0)
+                    if sid == m.sid_a:      # A dropped; B reported (b_wins, a_wins)
+                        rep = m.result_b
+                        a_wins, b_wins = rep[1], rep[0]
+                    else:                   # B dropped; A reported (a_wins, b_wins)
+                        rep = m.result_a
+                        a_wins, b_wins = rep[0], rep[1]
+                    a_wins = max(prev[0], min(int(a_wins), MAX_COUNTED_GAMES))
+                    b_wins = max(prev[1], min(int(b_wins), MAX_COUNTED_GAMES))
+                    delta_a = a_wins - prev[0]
+                    delta_b = b_wins - prev[1]
+                    if (delta_a + delta_b) > 0:
+                        # The report advances the series by at least one game.
+                        m.counted = (a_wins, b_wins)  # type: ignore[attr-defined]
+                        winner_name = (m.user_a if delta_a > delta_b
+                                       else m.user_b if delta_b > delta_a else "TIE")
+                        log.info("forfeit-on-drop match=%s: %s dropped; per peer report "
+                                 "a=%d b=%d -> %s", mid, session.username if session else sid,
+                                 a_wins, b_wins, winner_name)
+                        try:
+                            if self.upstream_url:
+                                # Edge node: the leader owns the DB — post upstream
+                                # or the result is never recorded.
+                                await self._upstream_post("/api/internal/result", {
+                                    "match_id": mid, "user_a": m.user_a, "user_b": m.user_b,
+                                    "a_wins": a_wins, "b_wins": b_wins,
+                                    "is_ranked": m.is_ranked, "region": self.region_code,
+                                    "platform_a": getattr(m, "platform_a", "") or "",
+                                    "platform_b": getattr(m, "platform_b", "") or "",
+                                    "char_a": getattr(m, "char_a", None),
+                                    "char_b": getattr(m, "char_b", None),
+                                })
+                            else:
+                                await self._finalize_outcome(
+                                    mid, m.user_a, m.user_b, delta_a, delta_b, m.is_ranked,
+                                    char_a=getattr(m, "char_a", None),
+                                    char_b=getattr(m, "char_b", None),
+                                    game_no=(a_wins + b_wins))
+                        except Exception as e:
+                            log.warning("forfeit finalize failed match=%s: %s", mid, e)
+                        m.finalized = True
+                        m.finalized_at = time.time()
+                        try:
+                            await self._after_match_finalize(m)
+                        except Exception:
+                            pass
+                        if other:
+                            await self.send(other, f"CANCEL {mid}")
+                            other.state = "logged_in"
+                            other.match_id = None
+                        forfeit_done = True
+                if forfeit_done:
+                    # Leave the finalized match for the janitor's grace linger.
+                    continue
                 if other:
                     await self.send(other, f"CANCEL {mid}")
                     other.state = "logged_in"
@@ -2085,6 +2452,23 @@ class FistbumpServer:
         while True:
             await asyncio.sleep(10)
             now = time.time()
+            # Reap TCP sessions that have gone silent (NAT drop with no RST, dead
+            # client). The 1.9.0 client PINGs every 60s from run_netplay — in
+            # lobby AND mid-match — so an active player stays well under the 180s
+            # threshold; only genuinely dead links are unwound. cleanup_session
+            # mutates self.sessions, so snapshot first.
+            for sid, s in list(self.sessions.items()):
+                if (now - s.last_activity) <= SESSION_IDLE_TIMEOUT_S:
+                    continue
+                # Only reap on idle when we EXPECT periodic traffic: a pre-auth
+                # socket (never authenticated) or a heartbeat-capable client (a
+                # missing PING = dead link). A logged-in 1.4.1 client has no
+                # heartbeat and may legitimately idle in the hub/room — leave it
+                # to TCP keepalive, exactly as on the pre-1.9.0 server.
+                if s.state == "connected" or s.version in HEARTBEAT_VERSIONS:
+                    log.info("janitor: reap idle sid=%s state=%s ver=%s (idle %.0fs)",
+                             sid, s.state, s.version or "?", now - s.last_activity)
+                    await self.cleanup_session(sid)
             # Kick idle queued clients
             for q in (self.queue_casual, self.queue_ranked):
                 for sid in list(q):
@@ -2093,6 +2477,10 @@ class FistbumpServer:
                         log.info("janitor: kick idle sid=%s", sid)
                         q.remove(sid)
                         s.state = "logged_in"
+                        # Tell the client it's no longer searching, or its UI
+                        # sits on "Finding match..." forever (the searching
+                        # state has no client-side watchdog).
+                        await self.send(s, "QUEUE timeout")
             # Reap rooms that have been empty (no members) past grace.
             for code, room in list(self.rooms.items()):
                 if not room.members and room.empty_since is not None:
@@ -2115,6 +2503,7 @@ class FistbumpServer:
                         pass
 
             # Cancel stuck matches (no punch within timeout)
+            requeued_any = False
             for mid, m in list(self.matches.items()):
                 age = now - m.created_at
                 # Finalized matches: linger briefly so late duplicate RESULTs
@@ -2148,15 +2537,22 @@ class FistbumpServer:
                         await self.send(sess, f"CANCEL {mid}")
                         sess.match_id = None
                         sess.udp_endpoint = None
-                        if accepted and (a_accepted != b_accepted):
-                            # Partial accept: this player accepted, the other
-                            # didn't. Re-queue them to their previous mode.
-                            mode = sess.queue_mode or "casual"
+                        if (accepted and (a_accepted != b_accepted)
+                                and sess.room_code is None and sess.queue_mode):
+                            # Partial accept from a queued (non-room) player who
+                            # accepted while the other side didn't: re-queue them
+                            # to their previous mode and say so, so the client
+                            # resumes searching instead of stalling. Room members
+                            # are intentionally excluded — re-queuing them would
+                            # dump a private-room player into the public queue.
+                            mode = sess.queue_mode
                             queue = self.queue_ranked if mode == "ranked" else self.queue_casual
                             if sess.sid not in queue:
                                 queue.append(sess.sid)
                             sess.state = "queued"
                             sess.queued_at = now
+                            requeued_any = True
+                            await self.send(sess, f"QUEUE requeued {mode}")
                         else:
                             # No-accept (both timed out, or this is the one who
                             # didn't respond): kick to logged_in. No re-queue.
@@ -2167,6 +2563,10 @@ class FistbumpServer:
                     )
                     del self.matches[mid]
                     self.relay_routes.pop(mid, None)
+
+            # A janitor requeue may now pair with a waiting player.
+            if requeued_any:
+                await self.try_match()
 
             # Prune the per-IP anti-abuse dicts so memory doesn't grow with
             # every unique source IP ever seen (CGNAT churn, port scanners).
@@ -2337,8 +2737,8 @@ class FistbumpServer:
   <span data-i18n-es>Tabla de Clasificación</span>
 </h2>
 <p class="sub">
-  <span data-i18n-en>Players are unranked until they finish {PLACEMENT_MATCHES} placement matches. ELO ±32 per game (K=32).</span>
-  <span data-i18n-es>Los jugadores quedan Unranked hasta completar {PLACEMENT_MATCHES} partidas de clasificación. ±32 ELO por partida (K=32).</span>
+  <span data-i18n-en>Players are unranked until they finish {PLACEMENT_MATCHES} placement matches. ELO K-factor scales down as you climb (placement {K_PLACEMENT} → established {K_ESTABLISHED} → high {K_HIGH}); repeated same-day rematches against one opponent count for less.</span>
+  <span data-i18n-es>Los jugadores quedan Unranked hasta completar {PLACEMENT_MATCHES} partidas de clasificación. El factor K del ELO baja al subir (clasificación {K_PLACEMENT} → establecido {K_ESTABLISHED} → alto {K_HIGH}); las revanchas repetidas el mismo día contra el mismo rival cuentan menos.</span>
 </p>
 <table>
 <thead><tr>
@@ -2582,15 +2982,28 @@ class FistbumpServer:
         wr = (wins * 100 // total) if total else 0
         elo_disp = str(elo) if total >= PLACEMENT_MATCHES else "—"
 
-        # Match history
+        # Match history — one row PER GAME (from the games table), so an in-game
+        # rematch series shows each game separately instead of the single matches
+        # row (one per match_id) that gets overwritten every game. Matches with no
+        # games rows (DISPUTED, or pre-1.9.0 before the games table existed) fall
+        # back to the matches row via the UNION so nothing is lost.
         rows_cur = self.db.execute(
-            "SELECT id, p1, p2, winner, p1_elo_delta, p2_elo_delta, created_at, completed_at "
-            "FROM matches WHERE (p1=? OR p2=?) AND completed_at IS NOT NULL "
-            "ORDER BY completed_at DESC LIMIT 50",
-            (username, username),
+            "SELECT p1, p2, winner, da, db, ts FROM ("
+            "  SELECT m.p1 AS p1, m.p2 AS p2, g.winner AS winner,"
+            "         g.elo_delta_a AS da, g.elo_delta_b AS db, g.ts AS ts"
+            "    FROM games g JOIN matches m ON g.match_id = m.id"
+            "   WHERE m.p1=? OR m.p2=?"
+            "  UNION ALL"
+            "  SELECT m.p1, m.p2, m.winner, m.p1_elo_delta, m.p2_elo_delta,"
+            "         COALESCE(m.completed_at, m.created_at) AS ts"
+            "    FROM matches m"
+            "   WHERE (m.p1=? OR m.p2=?) AND m.completed_at IS NOT NULL"
+            "     AND NOT EXISTS (SELECT 1 FROM games g2 WHERE g2.match_id = m.id)"
+            ") ORDER BY ts DESC LIMIT 50",
+            (username, username, username, username),
         )
         history_rows = []
-        for mid, p1, p2, winner, d1, d2, created_at, completed_at in rows_cur:
+        for p1, p2, winner, d1, d2, completed_at in rows_cur:
             is_p1 = (p1 == username)
             opp = p2 if is_p1 else p1
             opp_link = f'<a href="/user/{_html.escape(opp)}">{_html.escape(opp)}</a>'
@@ -2607,7 +3020,7 @@ class FistbumpServer:
             else:
                 outcome = '<span class="loss">LOSS</span>'
                 delta_disp = str(my_delta) if my_delta < 0 else f"+{my_delta}"
-            ts = time.strftime("%Y-%m-%d %H:%M", time.gmtime(completed_at or created_at))
+            ts = time.strftime("%Y-%m-%d %H:%M", time.gmtime(completed_at or 0))
             history_rows.append(
                 f'<tr><td>{ts}</td><td>vs {opp_link}</td>'
                 f'<td>{outcome}</td><td class="elo">{delta_disp}</td></tr>'
@@ -2988,6 +3401,14 @@ class FistbumpServer:
         tcp_server = await asyncio.start_server(
             self.handle_client, self.host, self.tcp_port
         )
+        # Transport-level keepalive as a safety net under the app PING/PONG: on
+        # Linux (prod) accepted sockets inherit the listener's SO_KEEPALIVE, so
+        # a silently-dropped connection eventually surfaces as a read error.
+        for _s in tcp_server.sockets:
+            try:
+                _s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
         log.info("TCP listening on :%d", self.tcp_port)
         async with tcp_server:
             await tcp_server.serve_forever()
