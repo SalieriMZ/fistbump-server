@@ -1,6 +1,6 @@
-# fistbump-server
+# 3sx-online-server
 
-Matchmaking + ELO + lobby + relay server for [`SalieriMZ/3sx-online`](https://github.com/SalieriMZ/3sx-online) — the cross-platform rollback netplay fork of [crowded-street/3sx](https://github.com/crowded-street/3sx).
+A **fistbump-compatible** matchmaking + ELO + lobby + relay server for [`SalieriMZ/3sx-online`](https://github.com/SalieriMZ/3sx-online) — the cross-platform rollback netplay fork of [crowded-street/3sx](https://github.com/crowded-street/3sx). It speaks the `fistbump` line protocol (the `FISTBUMP_*` messages the client sends), so any fistbump client can pair against it.
 
 Single-process Python 3.11+ asyncio server. SQLite for accounts + match history. No external services required to run locally; production drops a systemd unit on a single Linux box and points the client at it via `regions.txt`.
 
